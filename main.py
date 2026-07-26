@@ -968,7 +968,7 @@ KV = '''
                 circle: self.center_x, self.center_y, min(self.width, self.height) * 0.28
                 width: 1
             Color:
-                rgba: 0, root.pulse_color[0], root.pulse_color[1], root.pulse_alpha
+                rgba: 0, 0.8, 1, root.pulse_alpha
             Line:
                 circle: self.center_x, self.center_y, root.pulse_radius * min(self.width, self.height) * 0.45
                 width: 2
@@ -1112,7 +1112,7 @@ class DPFLayout(BoxLayout):
     pulse_alpha = NumericProperty(0.1)
     pulse_radius = NumericProperty(0.3)
     orb_glow = NumericProperty(0.0)
-    pulse_color = ListProperty([0.5, 0.8])
+    # pulse_color handled via update_pulse_color method
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1163,11 +1163,13 @@ class DPFLayout(BoxLayout):
         self._pulse_anim = anim
 
     def _flash_green(self):
-        old_color = list(self.pulse_color)
-        self.pulse_color = [0, 1]
         self.pulse_alpha = 0.6
         self.pulse_radius = 0.5
-        Clock.schedule_once(lambda dt: setattr(self, 'pulse_color', old_color), 0.8)
+        Clock.schedule_once(lambda dt: self._restore_pulse(), 0.8)
+
+    def _restore_pulse(self):
+        self.pulse_alpha = 0.15
+        self.pulse_radius = 0.3
 
     # ── Chat Messages ──────────────────────────────────────────────────
     def add_system_msg(self, msg):
@@ -1183,32 +1185,38 @@ class DPFLayout(BoxLayout):
         chat = self.ids.chat_box
         is_ai = sender in ('DPF', 'SYSTEM')
         is_sys = sender == 'SYSTEM'
+        w = max(self.width, 250)
 
         box = BoxLayout(orientation='vertical', size_hint_y=None, height=10, spacing=2)
 
         if is_sys:
-            s = Label(text=f'⚙ {msg}', font_size='11sp',
+            s = Label(text=msg, font_size='11sp',
                       color=(0.5, 0.5, 0.6, 0.8), size_hint_y=None, height=18,
-                      halign='center', text_size=(self.width * 0.9, None))
+                      halign='center', text_size=(w * 0.9, None))
             box.add_widget(s)
+            box.height = 22
         else:
-            s = Label(text=f'⚡ {sender}' if is_ai else f'{sender} 💨',
+            prefix = '⚡ ' + sender if is_ai else sender + ' 💨'
+            s = Label(text=prefix,
                       font_size='10sp', bold=True,
                       color=(*sender_color, 1), size_hint_y=None, height=16,
                       halign='left' if is_ai else 'right',
-                      text_size=(self.width * 0.5, None))
+                      text_size=(w * 0.5, None))
             m = Label(text=msg, font_size='12sp',
-                      color=(*msg_color, 0.95), size_hint_y=None, height=10,
+                      color=(*msg_color, 0.95),
                       halign='left' if is_ai else 'right',
-                      text_size=(self.width * 0.88, None),
-                      valign='top')
+                      valign='top',
+                      size_hint_y=None, height=30,
+                      text_size=(w * 0.88, None))
             box.add_widget(s)
             box.add_widget(m)
 
-            def update_height(inst, val):
-                inst.height = max(20, inst.texture_size[1] + 8)
-                total = sum(c.height for c in chat.children) + chat.padding[1] * 2
-                chat.height = max(total, chat.parent.height)
+            def update_height(inst, val, _box=box, _chat=chat):
+                th = inst.texture_size[1] if inst.texture_size[1] > 0 else 30
+                inst.height = max(30, th + 10)
+                _box.height = 16 + inst.height + 4
+                total = sum(c.height for c in _chat.children) + _chat.padding[1] * 2
+                _chat.height = max(total, _chat.parent.height if _chat.parent else 200)
             m.bind(texture_size=update_height)
 
         chat.add_widget(box)
@@ -1221,7 +1229,7 @@ class DPFLayout(BoxLayout):
         self.is_listening = True
         self.status_text = 'LISTENING...'
         self.orb_text = '🎤 LISTENING'
-        self.pulse_color = [0, 1]
+        self.pulse_alpha = 0.5
         if AndroidAvailable:
             try:
                 Intent = autoclass('android.content.Intent')
@@ -1246,7 +1254,7 @@ class DPFLayout(BoxLayout):
         self.is_listening = False
         self.status_text = 'TYPE MODE'
         self.orb_text = 'USE TEXT INPUT'
-        self.pulse_color = [0.5, 0.8]
+        self.pulse_alpha = 0.15
         self.add_system_msg("🎤 Voice needs Android. Type your commands!")
 
     def _on_voice_result(self, request_code, result_code, data):
@@ -1263,7 +1271,7 @@ class DPFLayout(BoxLayout):
         self.is_listening = False
         self.status_text = 'STANDBY'
         self.orb_text = 'READY'
-        self.pulse_color = [0.5, 0.8]
+        self.pulse_alpha = 0.15
 
     # ── Input Handling ─────────────────────────────────────────────────
     def send_text(self, text):
@@ -1276,7 +1284,7 @@ class DPFLayout(BoxLayout):
         self.add_user_msg(text)
         self.status_text = 'THINKING...'
         self.orb_text = '🧠 PROCESSING'
-        self.pulse_color = [1, 0.8]
+        self.pulse_alpha = 0.4
         Clock.schedule_once(lambda dt: self._process(text), 0.3)
 
     def _process(self, text):
@@ -1286,7 +1294,7 @@ class DPFLayout(BoxLayout):
         self.speak(response)
         self.status_text = 'ONLINE'
         self.orb_text = 'READY'
-        self.pulse_color = [0.5, 0.8]
+        self.pulse_alpha = 0.15
 
     def quick_action(self, action):
         actions = {
