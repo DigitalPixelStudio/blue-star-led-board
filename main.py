@@ -1283,9 +1283,7 @@ class JARVISApp(App):
             print(tb)
             box = BoxLayout(orientation='vertical', padding=20, spacing=10)
             box.add_widget(KivyLabel(text='JARVIS Error', font_size='20sp', color=(1,0,0,1), size_hint_y=0.1))
-            err_label = KivyLabel(text=str(e) + '
-
-' + tb, font_size='11sp', color=(1,0.5,0.5,1),
+            err_label = KivyLabel(text=str(e) + chr(10) + chr(10) + tb, font_size='11sp', color=(1,0.5,0.5,1),
                                    size_hint_y=0.9, text_size=(None, None), valign='top', halign='left')
             box.add_widget(err_label)
             return box
