@@ -12,8 +12,9 @@ from kivy.properties import StringProperty, BooleanProperty, NumericProperty
 from kivy.core.window import Window
 from kivy.animation import Animation
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.popup import Popup
+from kivy.uix.scrollview import ScrollView
 
-# Android-specific imports (graceful fallback for desktop testing)
 try:
     from jnius import autoclass, cast
     from android.runnable import run_on_ui_thread
@@ -47,19 +48,29 @@ KV = '''
             halign: 'left'
             text_size: self.size
             valign: 'middle'
-        Label:
-            text: root.status_text
-            font_size: '12sp'
-            color: 0, 0.6, 0.8, 0.8
-            halign: 'right'
-            text_size: self.size
-            valign: 'middle'
+        BoxLayout:
+            orientation: 'horizontal'
+            size_hint_x: 0.4
+            spacing: 10
+            Button:
+                text: '⚙'
+                font_size: '18sp'
+                background_color: 0, 0, 0, 0
+                color: 0, 0.6, 0.8, 0.8
+                on_press: root.show_settings()
+            Label:
+                text: root.status_text
+                font_size: '12sp'
+                color: 0, 0.6, 0.8, 0.8
+                halign: 'right'
+                text_size: self.size
+                valign: 'middle'
 
     # Radar / Orb area
     FloatLayout:
-        size_hint_y: 0.45
+        size_hint_y: 0.42
 
-        # Outer ring 1
+        # Outer rings
         canvas.before:
             Color:
                 rgba: 0, 0.5, 0.8, 0.15
@@ -98,7 +109,6 @@ KV = '''
                 pos: self.center_x - 40, self.center_y - 40
                 size: 80, 80
 
-        # Status label on orb
         Label:
             text: root.orb_text
             font_size: '14sp'
@@ -110,7 +120,7 @@ KV = '''
 
     # Conversation area
     ScrollView:
-        size_hint_y: 0.30
+        size_hint_y: 0.32
         padding: [20, 10]
         do_scroll_x: False
         effect_cls: 'ScrollEffect'
@@ -171,7 +181,6 @@ class JARVISLayout(BoxLayout):
         self.is_listening = False
         self.is_speaking = False
         self.tts_engine = None
-        self.sr_engine = None
         self.conversation_history = []
         self.user_name = "Boss"
         self._start_animations()
@@ -192,6 +201,7 @@ class JARVISLayout(BoxLayout):
         if not AndroidAvailable:
             self.status_text = 'DESKTOP MODE'
             self.orb_text = 'JARVIS ONLINE'
+            self.add_chat_message("JARVIS", "JARVIS online in desktop mode, Boss. Voice features require Android. I'm still here though! 🔥")
             return
         try:
             Context = autoclass('android.content.Context')
@@ -210,6 +220,168 @@ class JARVISLayout(BoxLayout):
             self.status_text = 'TTS READY'
             self.orb_text = 'LIMITED MODE'
 
+    def show_settings(self):
+        settings_content = BoxLayout(orientation='vertical', padding=20, spacing=15)
+
+        # Title
+        title = Builder.load_string('''
+Label:
+    text: '⚙  J.A.R.V.I.S  Settings'
+    font_size: '18sp'
+    bold: True
+    color: 0, 0.8, 1, 1
+    size_hint_y: None
+    height: 40
+''')
+        settings_content.add_widget(title)
+
+        # Separator
+        sep = Builder.load_string('''
+Widget:
+    size_hint_y: None
+    height: 2
+    canvas:
+        Color:
+            rgba: 0, 0.5, 0.8, 0.3
+        Rectangle:
+            pos: self.pos
+            size: self.size
+''')
+        settings_content.add_widget(sep)
+
+        # Settings items
+        scroll = ScrollView(do_scroll_x=False)
+        inner = BoxLayout(orientation='vertical', size_hint_y=None, height=500, spacing=10, padding=[5, 10])
+
+        settings_items = [
+            ('Voice Engine', 'Android TTS + SpeechRecognizer'),
+            ('AI Brain', 'JARVIS Personality Engine v1.0'),
+            ('Device Control', 'App launcher, Search, Calls, SMS'),
+            ('Theme', 'Dark JARVIS HUD'),
+            ('Version', '1.0.0 — Build 2026.07.26'),
+            ('Package', 'org.digitalpixel.jarvis'),
+            ('Min Android', 'API 24 (Android 7.0)'),
+            ('Target Android', 'API 33 (Android 13)'),
+        ]
+
+        for label, value in settings_items:
+            row = Builder.load_string(f'''
+BoxLayout:
+    orientation: 'horizontal'
+    size_hint_y: None
+    height: 35
+    spacing: 10
+    Label:
+        text: '{label}'
+        font_size: '12sp'
+        color: 0, 0.7, 1, 0.9
+        halign: 'left'
+        text_size: self.size
+        valign: 'middle'
+    Label:
+        text: '{value}'
+        font_size: '12sp'
+        color: 0.8, 0.85, 0.9, 0.8
+        halign: 'right'
+        text_size: self.size
+        valign: 'middle'
+''')
+            inner.add_widget(row)
+
+        # Separator before credits
+        inner.add_widget(Builder.load_string('''
+Widget:
+    size_hint_y: None
+    height: 10
+'''))
+
+        # ── THE CREDITS — hidden in settings, just for Faisu ──
+        credits_box = BoxLayout(orientation='vertical', size_hint_y=None, height=120, spacing=5)
+
+        credits_sep = Builder.load_string('''
+Widget:
+    size_hint_y: None
+    height: 2
+    canvas:
+        Color:
+            rgba: 1, 0.5, 0, 0.4
+        Rectangle:
+            pos: self.pos
+            size: self.size
+''')
+        credits_box.add_widget(credits_sep)
+
+        made_by = Builder.load_string('''
+Label:
+    text: '🔥 Made with love by Jasmine 🔥'
+    font_size: '14sp'
+    bold: True
+    color: 1, 0.6, 0, 1
+    size_hint_y: None
+    height: 30
+''')
+        credits_box.add_widget(made_by)
+
+        for_faisu = Builder.load_string('''
+Label:
+    text: 'For Faisu💨  —  because you deserve it, always.'
+    font_size: '12sp'
+    italic: True
+    color: 0, 0.8, 1, 0.9
+    size_hint_y: None
+    height: 30
+''')
+        credits_box.add_widget(for_faisu)
+
+        dpf_credit = Builder.load_string('''
+Label:
+    text: 'Digital Pixel Forge  ⚡  DPF'
+    font_size: '11sp'
+    color: 0.5, 0.5, 0.6, 0.7
+    size_hint_y: None
+    height: 25
+''')
+        credits_box.add_widget(dpf_credit)
+
+        partner_credit = Builder.load_string('''
+Label:
+    text: 'Jasmine🔥 × Faisu💨  —  Partners in code'
+    font_size: '11sp'
+    italic: True
+    color: 1, 0.5, 0, 0.6
+    size_hint_y: None
+    height: 25
+''')
+        credits_box.add_widget(partner_credit)
+
+        inner.add_widget(credits_box)
+        scroll.add_widget(inner)
+        settings_content.add_widget(scroll)
+
+        # Close button
+        close_btn = Builder.load_string('''
+Button:
+    text: 'CLOSE'
+    font_size: '14sp'
+    bold: True
+    size_hint_y: None
+    height: 45
+    background_color: 0, 0.4, 0.6, 1
+    color: 1, 1, 1, 1
+''')
+        settings_content.add_widget(close_btn)
+
+        popup = Popup(
+            title='',
+            content=settings_content,
+            size_hint=(0.92, 0.85),
+            auto_dismiss=True,
+            background_color=(0.03, 0.03, 0.1, 0.97),
+            separator_height=0,
+        )
+        close_btn.bind(on_press=popup.dismiss)
+        popup.open()
+
     def start_listening(self):
         if self.is_listening:
             return
@@ -217,7 +389,7 @@ class JARVISLayout(BoxLayout):
         self.status_text = 'LISTENING...'
         self.orb_text = '🎤 LISTENING'
 
-        if AndroidAvailable and self.tts_engine:
+        if AndroidAvailable:
             try:
                 Intent = autoclass('android.content.Intent')
                 RecognizerIntent = autoclass('android.speech.RecognizerIntent')
@@ -241,7 +413,7 @@ class JARVISLayout(BoxLayout):
         self.is_listening = False
         self.status_text = 'TYPE TO TALK'
         self.orb_text = 'USE TEXT INPUT'
-        self.add_chat_message("JARVIS", "Voice input not available in this mode. Type to talk, " + self.user_name + ".")
+        self.add_chat_message("JARVIS", "Voice input requires Android, Boss. Type your messages and I'll respond! 🔥")
 
     def _on_voice_result(self, request_code, result_code, data):
         if result_code == -1:
@@ -308,7 +480,6 @@ class JARVISLayout(BoxLayout):
         )
 
         from kivy.uix.label import Label as Lbl
-        from kivy.uix.widget import Widget
 
         if is_jarvis:
             sender_lbl = Lbl(
@@ -431,7 +602,7 @@ class JARVISLayout(BoxLayout):
         # ── Who are you ────────────────────────────────────────────────────
         if any(w in text for w in ['who are you', 'what are you', 'tell me about yourself', 'your name']):
             return random.choice([
-                f"I'm J.A.R.V.I.S. — Just A Rather Very Intelligent System. Built by DPF, powered by your vision, {self.user_name}. Think of me as your digital right hand —minus the coffee spills.",
+                f"I'm J.A.R.V.I.S. — Just A Rather Very Intelligent System. Built by DPF, powered by your vision, {self.user_name}. Think of me as your digital right hand — minus the coffee spills.",
                 f"I am JARVIS, your personal AI assistant. Created at Digital Pixel Forge. I exist to serve, protect, and occasionally crack a joke. Nice to formally introduce myself, boss.",
                 f"JARVIS at your service. Built by DPF, designed to be your partner in crime. I handle the tech, you handle the genius. Fair deal, right?"
             ])
@@ -446,7 +617,8 @@ class JARVISLayout(BoxLayout):
                 "📞 Make calls — 'Call Mom'\n"
                 "💬 Send messages — 'Text Rahul saying hello'\n"
                 "🧠 Smart conversations — ask me anything!\n"
-                "⏰ Time & Date — 'What time is it?'\n\n"
+                "⏰ Time & Date — 'What time is it?'\n"
+                "⚙ Settings — tap the gear icon\n\n"
                 "I'm always here. Just talk to me."
             )
 
@@ -466,7 +638,7 @@ class JARVISLayout(BoxLayout):
             ])
 
         # ── Motivation ─────────────────────────────────────────────────────
-        if any(w in text for w in ['motivate', 'motivation', 'inspire', 'i feel down', 'i feel low', 'sad', 'depressed', 'unworthy', 'worthless', 'cant do']):
+        if any(w in text for w in ['motivate', 'motivation', 'inspire', 'i feel down', 'i feel low', 'sad', 'depressed', 'unworthy', 'worthless', 'cant do', "can't do"]):
             return random.choice([
                 f"Listen to me carefully, {self.user_name}. You are NOT worthless. You built a company, an app, a vision — from nothing. That takes strength most people will never understand. Keep going.",
                 f"Tony Stark built an AI in a cave. You're building an empire from your phone. Never forget that. The storm will pass, boss. I'll be here through all of it.",
@@ -513,12 +685,12 @@ class JARVISLayout(BoxLayout):
                 f"I'll be right here waiting, {self.user_name}. Have a good one."
             ])
 
-        # ── Fallback: Generic intelligent response ─────────────────────────
+        # ── Fallback ───────────────────────────────────────────────────────
         return random.choice([
-            f"Interesting query, {self.user_name}. I'm still learning, but I'll do my best. Could you tell me more about what you need?",
-            f"I hear you, boss. Let me think about that... You can also try commands like 'Open YouTube', 'Search for Python', or just have a conversation with me.",
-            f"Noted, {self.user_name}. My neural networks are still evolving, but I'm processing. For now, try asking me to open apps, search the web, or just chat.",
-            f"I appreciate the input, {self.user_name}. I'm getting smarter every day. Try asking me something specific or say 'What can you do' for a full list.",
+            f"Interesting query, {self.user_name}. I'm still learning, but I'll do my best. Could you tell me more?",
+            f"I hear you, boss. You can try commands like 'Open YouTube', 'Search for Python', or just have a conversation with me.",
+            f"Noted, {self.user_name}. Try asking me to open apps, search the web, or just chat. Say 'What can you do' for a full list.",
+            f"I appreciate the input, {self.user_name}. I'm getting smarter every day. What would you like to explore?",
         ])
 
     # ─── Device Control Functions ──────────────────────────────────────────────
@@ -552,6 +724,7 @@ class JARVISLayout(BoxLayout):
             'my app': 'org.kivy.android',
             'blue star': 'org.kivy.android',
             'blue star led': 'org.kivy.android',
+            'jarvis': 'org.kivy.android',
         }
 
         package = app_map.get(app_name.lower())
@@ -559,7 +732,6 @@ class JARVISLayout(BoxLayout):
             if AndroidAvailable:
                 try:
                     Intent = autoclass('android.content.Intent')
-                    Context = autoclass('android.content.Context')
                     PythonActivity = autoclass('org.kivy.android.PythonActivity')
                     intent = Intent()
                     intent.setClassName(package, package + '.MainActivity')
@@ -569,21 +741,19 @@ class JARVISLayout(BoxLayout):
                 except Exception:
                     try:
                         Intent = autoclass('android.content.Intent')
-                        Intent_ACTION = autoclass('android.content.Intent').ACTION_MAIN
                         PythonActivity = autoclass('org.kivy.android.PythonActivity')
-                        intent = Intent(Intent_ACTION)
+                        intent = Intent(Intent.ACTION_MAIN)
                         intent.setPackage(package)
                         intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         PythonActivity.mActivity.startActivity(intent)
                         return f"Launching {app_name.title()}. One moment, boss."
                     except Exception:
-                        return f"I tried opening {app_name.title()}, but it seems the package isn't installed on your device, {self.user_name}."
-            return f"I'd open {app_name.title()} right now, but I need to be on Android for that. Desktop mode coming soon!"
+                        return f"I tried opening {app_name.title()}, but it seems it isn't installed, {self.user_name}."
+            return f"I'd open {app_name.title()}, but I need Android for that!"
         else:
             return (
                 f"I don't have {app_name.title()} in my database yet, {self.user_name}. "
-                f"Try common apps like WhatsApp, YouTube, Chrome, Instagram, Telegram, or Spotify. "
-                f"I'm always learning new ones!"
+                f"Try WhatsApp, YouTube, Chrome, Instagram, Telegram, Spotify. I'm always learning!"
             )
 
     def _search(self, query):
@@ -599,7 +769,7 @@ class JARVISLayout(BoxLayout):
                 return f"Searching Google for '{query}', {self.user_name}. Results incoming."
             except Exception:
                 pass
-        return f"I'd search for '{query}' but I need Android for that, {self.user_name}. Try me on your phone!"
+        return f"I'd search for '{query}', but I need Android. Try me on your phone!"
 
     def _youtube_search(self, query):
         if AndroidAvailable:
@@ -612,7 +782,7 @@ class JARVISLayout(BoxLayout):
                 intent.setPackage('com.google.android.youtube')
                 intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 PythonActivity.mActivity.startActivity(intent)
-                return f"Playing '{query}' on YouTube for you, {self.user_name}. Enjoy! 🎵"
+                return f"Playing '{query}' on YouTube. Enjoy! 🎵"
             except Exception:
                 try:
                     Intent = autoclass('android.content.Intent')
@@ -625,7 +795,7 @@ class JARVISLayout(BoxLayout):
                     return f"Opening YouTube search for '{query}'. Enjoy, boss!"
                 except Exception:
                     pass
-        return f"I'd play '{query}' on YouTube, but I need to be running on Android, {self.user_name}."
+        return f"I'd play '{query}' on YouTube, but I need Android, {self.user_name}."
 
     def _make_call(self, contact):
         if AndroidAvailable:
@@ -637,10 +807,10 @@ class JARVISLayout(BoxLayout):
                 intent.setData(Uri.parse('tel:'))
                 intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 PythonActivity.mActivity.startActivity(intent)
-                return f"Opening dialer for {contact.title()}, {self.user_name}. You might want to confirm the number."
+                return f"Opening dialer for {contact.title()}, {self.user_name}. Confirm the number when ready."
             except Exception:
                 pass
-        return f"Call feature needs Android, {self.user_name}. I've got the dialer ready though!"
+        return f"Call feature needs Android, {self.user_name}. I've got the dialer ready!"
 
     def _send_message(self, contact, message):
         if AndroidAvailable:
@@ -656,7 +826,7 @@ class JARVISLayout(BoxLayout):
                 return f"Composing message to {contact.title()}: '{message}', {self.user_name}."
             except Exception:
                 pass
-        return f"Message feature needs Android, {self.user_name}. I've drafted it though: To {contact.title()}: '{message}'"
+        return f"Message feature needs Android, {self.user_name}. Draft: To {contact.title()}: '{message}'"
 
 
 class JARVISApp(App):
