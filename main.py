@@ -2,6 +2,7 @@ import time
 import os
 import re
 import random
+import traceback
 from datetime import datetime
 
 from kivy.app import App
@@ -12,6 +13,7 @@ from kivy.animation import Animation
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
+from kivy.uix.label import Label as KivyLabel
 
 try:
     from jnius import autoclass, cast
@@ -268,15 +270,18 @@ class JARVISLayout(BoxLayout):
         try:
             context = get_context()
             TTS = autoclass('android.speech.tts.TextToSpeech')
-            self.tts_engine = TTS(get_activity(), None)
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            activity_instance = PythonActivity.mActivity
+            self.tts_engine = TTS(activity_instance, None)
             self.tts_engine.setLanguage(autoclass('java.util.Locale').US)
             self.tts_engine.setSpeechRate(1.05)
             self.status_text = 'ONLINE'
             self.orb_text = 'JARVIS ONLINE'
             self.speak(f"JARVIS online. All device systems operational, {self.user_name}. Ready for your command.")
-        except Exception:
+        except Exception as e:
             self.status_text = 'LIMITED'
             self.orb_text = 'PARTIAL MODE'
+            print(f"[JARVIS] TTS init error: {e}")
 
     # ─── SETTINGS PANEL ───────────────────────────────────────────────────
     def show_settings(self):
@@ -402,10 +407,16 @@ Button:
                 intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, 'en-US')
                 intent.putExtra(RecognizerIntent.EXTRA_PROMPT, 'Speak now...')
-                activity.startActivityForResult(intent, 1001)
                 PythonActivity = autoclass('org.kivy.android.PythonActivity')
-                PythonActivity.theActivity.setHresultCallback(self._on_voice_result)
-            except Exception:
+                act = PythonActivity.mActivity
+                act.startActivityForResult(intent, 1001)
+                try:
+                    act.setHresultCallback(self._on_voice_result)
+                except AttributeError:
+                    print("[JARVIS] setHresultCallback not available, using fallback")
+                    self._fallback_listening()
+            except Exception as e:
+                print(f"[JARVIS] Voice init error: {e}")
                 self._fallback_listening()
         else:
             self._fallback_listening()
@@ -1264,7 +1275,20 @@ class DeviceController:
 class JARVISApp(App):
     def build(self):
         self.title = 'J.A.R.V.I.S'
-        return Builder.load_string(KV)
+        try:
+            return Builder.load_string(KV)
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"[JARVIS] KV LOAD ERROR: {e}")
+            print(tb)
+            box = BoxLayout(orientation='vertical', padding=20, spacing=10)
+            box.add_widget(KivyLabel(text='JARVIS Error', font_size='20sp', color=(1,0,0,1), size_hint_y=0.1))
+            err_label = KivyLabel(text=str(e) + '
+
+' + tb, font_size='11sp', color=(1,0.5,0.5,1),
+                                   size_hint_y=0.9, text_size=(None, None), valign='top', halign='left')
+            box.add_widget(err_label)
+            return box
 
 
 if __name__ == '__main__':
