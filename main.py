@@ -1,404 +1,1227 @@
 import time
 import os
 import re
+import json
 import random
-import traceback
-from datetime import datetime
+import sqlite3
+import hashlib
+from datetime import datetime, timedelta
+from pathlib import Path
 
 from kivy.app import App
 from kivy.lang import Builder
 from kivy.clock import Clock
-from kivy.properties import StringProperty, NumericProperty
+from kivy.properties import StringProperty, NumericProperty, BooleanProperty, ListProperty
 from kivy.animation import Animation
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.popup import Popup
+from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.scrollview import ScrollView
-from kivy.uix.label import Label as KivyLabel
+from kivy.uix.popup import Popup
+from kivy.uix.label import Label
+from kivy.uix.button import Button
+from kivy.uix.textinput import TextInput
+from kivy.uix.widget import Widget
+from kivy.graphics import Color, Ellipse, Rectangle, Line, RoundedRectangle
+from kivy.core.window import Window
 
 try:
     from jnius import autoclass, cast
-    from android import activity
+    from android import activity as android_activity
     AndroidAvailable = True
 except ImportError:
     AndroidAvailable = False
 
-# ─── Android Helpers ────────────────────────────────────────────────────────
-def get_activity():
-    if AndroidAvailable:
-        PythonActivity = autoclass('org.kivy.android.PythonActivity')
-        return PythonActivity.mActivity
-    return None
+# ═══════════════════════════════════════════════════════════════════════════
+#  MEMORY SYSTEM — SQLite-powered persistent brain
+# ═══════════════════════════════════════════════════════════════════════════
+class MemorySystem:
+    def __init__(self):
+        self.db_path = os.path.join(str(Path.home()), '.dpf_assistant', 'memory.db')
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path)
+        self._init_tables()
 
-def get_context():
-    if AndroidAvailable:
-        PythonActivity = autoclass('org.kivy.android.PythonActivity')
-        return PythonActivity.mActivity.getApplicationContext()
-    return None
+    def _init_tables(self):
+        c = self.conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT UNIQUE,
+            value TEXT,
+            category TEXT DEFAULT 'general',
+            importance INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT,
+            message TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS learned_commands (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern TEXT,
+            response TEXT,
+            times_used INTEGER DEFAULT 1
+        )''')
+        self.conn.commit()
 
-def send_intent(action, uri=None, package=None, extras=None, flags=None):
-    """Universal intent sender"""
-    try:
-        Intent = autoclass('android.content.Intent')
-        intent = Intent(action)
-        if uri:
+    def remember(self, key, value, category='general', importance=1):
+        c = self.conn.cursor()
+        c.execute('''INSERT OR REPLACE INTO memories (key, value, category, importance, accessed_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)''', (key, value, category, importance))
+        self.conn.commit()
+
+    def recall(self, key):
+        c = self.conn.cursor()
+        c.execute('''UPDATE memories SET accessed_at = CURRENT_TIMESTAMP WHERE key = ?''', (key,))
+        self.conn.commit()
+        c.execute('SELECT value FROM memories WHERE key = ?', (key,))
+        row = c.fetchone()
+        return row[0] if row else None
+
+    def recall_by_category(self, category):
+        c = self.conn.cursor()
+        c.execute('SELECT key, value FROM memories WHERE category = ?', (category,))
+        return c.fetchall()
+
+    def forget(self, key):
+        c = self.conn.cursor()
+        c.execute('DELETE FROM memories WHERE key = ?', (key,))
+        self.conn.commit()
+
+    def save_conversation(self, role, message):
+        c = self.conn.cursor()
+        c.execute('INSERT INTO conversations (role, message) VALUES (?, ?)', (role, message))
+        self.conn.commit()
+
+    def get_recent_conversations(self, limit=20):
+        c = self.conn.cursor()
+        c.execute('SELECT role, message, timestamp FROM conversations ORDER BY id DESC LIMIT ?', (limit,))
+        return list(reversed(c.fetchall()))
+
+    def learn_command(self, pattern, response):
+        c = self.conn.cursor()
+        c.execute('''INSERT OR REPLACE INTO learned_commands (pattern, response, times_used)
+            VALUES (?, ?, 1)''', (pattern, response))
+        self.conn.commit()
+
+    def get_learned_commands(self):
+        c = self.conn.cursor()
+        c.execute('SELECT pattern, response FROM learned_commands ORDER BY times_used DESC')
+        return c.fetchall()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PHONE CONTROLLER — Full Android device control
+# ═══════════════════════════════════════════════════════════════════════════
+class PhoneController:
+    def __init__(self):
+        self.flashlight_on = False
+        self._context = None
+        self._audio = None
+
+    def _get_context(self):
+        if self._context is None and AndroidAvailable:
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            self._context = PythonActivity.mActivity.getApplicationContext()
+        return self._context
+
+    def _get_activity(self):
+        if AndroidAvailable:
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            return PythonActivity.mActivity
+        return None
+
+    def _get_audio(self):
+        if self._audio is None:
+            ctx = self._get_context()
+            if ctx:
+                Context = autoclass('android.content.Context')
+                self._audio = ctx.getSystemService(Context.AUDIO_SERVICE)
+        return self._audio
+
+    def _start_intent(self, action, uri=None, package=None, extras=None):
+        try:
+            Intent = autoclass('android.content.Intent')
+            intent = Intent(action)
+            if uri:
+                Uri = autoclass('android.net.Uri')
+                intent.setData(Uri.parse(uri))
+            if package:
+                intent.setPackage(package)
+            if extras:
+                for k, v in extras.items():
+                    if isinstance(v, bool):
+                        intent.putExtra(k, v)
+                    elif isinstance(v, str):
+                        intent.putExtra(k, v)
+                    elif isinstance(v, int):
+                        intent.putExtra(k, v)
+            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            self._get_activity().startActivity(intent)
+            return True
+        except Exception:
+            return False
+
+    # ── Volume ──────────────────────────────────────────────────────────
+    def volume_up(self):
+        audio = self._get_audio()
+        if audio:
+            mx = audio.getStreamMaxVolume(3)
+            cur = audio.getStreamVolume(3)
+            nxt = min(cur + 5, mx)
+            audio.setStreamVolume(3, nxt, 0)
+            return f"🔊 Volume: {nxt}/{mx}"
+        return "Volume control needs Android"
+
+    def volume_down(self):
+        audio = self._get_audio()
+        if audio:
+            mx = audio.getStreamMaxVolume(3)
+            cur = audio.getStreamVolume(3)
+            nxt = max(cur - 5, 0)
+            audio.setStreamVolume(3, nxt, 0)
+            return f"🔉 Volume: {nxt}/{mx}"
+        return "Volume control needs Android"
+
+    def set_volume(self, level):
+        audio = self._get_audio()
+        if audio:
+            mx = audio.getStreamMaxVolume(3)
+            lv = max(0, min(level, mx))
+            audio.setStreamVolume(3, lv, 0)
+            return f"🔊 Volume set to {lv}/{mx}"
+        return "Volume control needs Android"
+
+    def mute(self):
+        audio = self._get_audio()
+        if audio:
+            audio.setStreamVolume(3, 0, 0)
+            return "🔇 Muted"
+        return "Mute needs Android"
+
+    # ── Brightness ──────────────────────────────────────────────────────
+    def set_brightness(self, level):
+        try:
+            ctx = self._get_context()
+            Settings = autoclass('android.provider.Settings$System')
+            val = max(0, min(255, int(level * 2.55)))
+            Settings.System.putInt(ctx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, val)
+            return f"☀️ Brightness: {level}%"
+        except Exception:
+            return "Brightness control needs Android"
+
+    def brightness_up(self):
+        try:
+            ctx = self._get_context()
+            Settings = autoclass('android.provider.Settings$System')
+            cur = Settings.System.getInt(ctx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, 128)
+            nxt = min(cur + 30, 255)
+            Settings.System.putInt(ctx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, nxt)
+            pct = int(nxt / 2.55)
+            return f"☀️ Brightness: {pct}%"
+        except Exception:
+            return "Brightness needs Android"
+
+    def brightness_down(self):
+        try:
+            ctx = self._get_context()
+            Settings = autoclass('android.provider.Settings$System')
+            cur = Settings.System.getInt(ctx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, 128)
+            nxt = max(cur - 30, 0)
+            Settings.System.putInt(ctx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, nxt)
+            pct = int(nxt / 2.55)
+            return f"🌤️ Brightness: {pct}%"
+        except Exception:
+            return "Brightness needs Android"
+
+    # ── Flashlight ──────────────────────────────────────────────────────
+    def toggle_flashlight(self):
+        try:
+            ctx = self._get_context()
+            camera_manager = ctx.getSystemService('camera')
+            if camera_manager:
+                self.flashlight_on = not self.flashlight_on
+                camera_manager.setTorchMode('0', self.flashlight_on)
+                return f"🔦 Flashlight {'ON' if self.flashlight_on else 'OFF'}"
+        except Exception:
+            pass
+        self.flashlight_on = not self.flashlight_on
+        return f"🔦 Flashlight {'ON' if self.flashlight_on else 'OFF'} (simulated)"
+
+    # ── WiFi ────────────────────────────────────────────────────────────
+    def wifi_toggle(self, on=True):
+        state = "enabled" if on else "disabled"
+        if self._start_intent('android.settings.WIFI_SETTINGS'):
+            return f"📶 WiFi settings opened — {state} it manually"
+        return "WiFi toggle needs Android"
+
+    # ── Bluetooth ───────────────────────────────────────────────────────
+    def bluetooth_toggle(self, on=True):
+        state = "enabled" if on else "disabled"
+        if self._start_intent('android.settings.BLUETOOTH_SETTINGS'):
+            return f"🔵 Bluetooth settings opened — {state} it manually"
+        return "Bluetooth toggle needs Android"
+
+    # ── Airplane Mode ───────────────────────────────────────────────────
+    def airplane_mode(self, on=True):
+        state = "ON" if on else "OFF"
+        if self._start_intent('android.settings.AIRPLANE_MODE_SETTINGS'):
+            return f"✈️ Airplane mode settings opened — turn {state}"
+        return "Airplane mode needs Android"
+
+    # ── Media Control ───────────────────────────────────────────────────
+    def media_play(self):
+        try:
+            KeyEvent = autoclass('android.view.KeyEvent')
+            ctx = self._get_context()
+            am = ctx.getSystemService('audio')
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY))
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY))
+            return "▶️ Playing"
+        except Exception:
+            return "Media control needs Android"
+
+    def media_pause(self):
+        try:
+            KeyEvent = autoclass('android.view.KeyEvent')
+            ctx = self._get_context()
+            am = ctx.getSystemService('audio')
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PAUSE))
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PAUSE))
+            return "⏸ Paused"
+        except Exception:
+            return "Media control needs Android"
+
+    def media_next(self):
+        try:
+            KeyEvent = autoclass('android.view.KeyEvent')
+            ctx = self._get_context()
+            am = ctx.getSystemService('audio')
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_NEXT))
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_NEXT))
+            return "⏭ Next track"
+        except Exception:
+            return "Media control needs Android"
+
+    def media_previous(self):
+        try:
+            KeyEvent = autoclass('android.view.KeyEvent')
+            ctx = self._get_context()
+            am = ctx.getSystemService('audio')
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PREVIOUS))
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PREVIOUS))
+            return "⏮ Previous track"
+        except Exception:
+            return "Media control needs Android"
+
+    # ── Navigation ──────────────────────────────────────────────────────
+    def go_home(self):
+        self._start_intent(Intent_ACTION_MAIN='android.intent.action.MAIN') if False else None
+        try:
+            Intent = autoclass('android.content.Intent')
+            intent = Intent(Intent.ACTION_MAIN)
+            intent.addCategory(Intent.CATEGORY_HOME)
+            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            self._get_activity().startActivity(intent)
+            return "🏠 Home"
+        except Exception:
+            return "Home needs Android"
+
+    def go_back(self):
+        try:
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            PythonActivity.mActivity.onKeyDown(4, None)
+            return "↩️ Back"
+        except Exception:
+            return "Back needs Android"
+
+    # ── App Launcher ────────────────────────────────────────────────────
+    APP_PACKAGES = {
+        'youtube': 'com.google.android.youtube',
+        'chrome': 'com.android.chrome',
+        'whatsapp': 'com.whatsapp',
+        'instagram': 'com.instagram.android',
+        'facebook': 'com.facebook.katana',
+        'twitter': 'com.twitter.android',
+        'telegram': 'org.telegram.messenger',
+        'maps': 'com.google.android.apps.maps',
+        'gmail': 'com.google.android.gm',
+        'camera': 'com.android.camera2',
+        'gallery': 'com.google.android.apps.photos',
+        'settings': 'com.android.settings',
+        'calculator': 'com.google.android.calculator',
+        'clock': 'com.google.android.deskclock',
+        'files': 'com.google.android.apps.nbu.files',
+        'play store': 'com.android.vending',
+        'music': 'com.google.android.apps.music',
+        'files': 'com.android.filemanager',
+        'contacts': 'com.google.android.contacts',
+        'dialer': 'com.google.android.dialer',
+        'messages': 'com.google.android.apps.messaging',
+        'spotify': 'com.spotify.music',
+        'netflix': 'com.netflix.mediaclient',
+        'amazon': 'com.amazon.mShop.android.shopping',
+        'snapchat': 'com.snapchat.android',
+        'tiktok': 'com.zhiliaoapp.musically',
+        'discord': 'com.discord',
+        'reddit': 'com.reddit.frontpage',
+        'teams': 'com.microsoft.teams',
+        'zoom': 'us.zoom.videomeetings',
+    }
+
+    def open_app(self, name):
+        name_lower = name.lower().strip()
+        pkg = self.APP_PACKAGES.get(name_lower)
+        if pkg:
+            Intent = autoclass('android.content.Intent')
+            intent = Intent(Intent.ACTION_MAIN)
+            intent.setPackage(pkg)
+            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            try:
+                self._get_activity().startActivity(intent)
+                return f"📱 Opening {name.title()}..."
+            except Exception:
+                pass
+        return f"Can't find {name.title()} installed"
+
+    # ── Google Search ───────────────────────────────────────────────────
+    def search_google(self, query):
+        uri = f"https://www.google.com/search?q={query.replace(' ', '+')}"
+        if self._start_intent('android.intent.action.VIEW', uri=uri):
+            return f"🔍 Searching: {query}"
+        return f"Search needs Android. Query: {query}"
+
+    def youtube_search(self, query):
+        uri = f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"
+        pkg = 'com.google.android.youtube'
+        if self._start_intent('android.intent.action.VIEW', uri=uri, package=pkg):
+            return f"📺 Playing '{query}' on YouTube 🎵"
+        if self._start_intent('android.intent.action.VIEW', uri=uri):
+            return f"📺 Opening YouTube: {query}"
+        return f"YouTube needs Android"
+
+    # ── Phone & SMS ─────────────────────────────────────────────────────
+    def make_call(self, contact=''):
+        if self._start_intent('android.intent.action.DIAL', uri='tel:'):
+            return f"📞 Opening dialer..."
+        return "Call needs Android"
+
+    def send_sms(self, contact='', message=''):
+        try:
+            Intent = autoclass('android.content.Intent')
+            intent = Intent(Intent.ACTION_SENDTO)
             Uri = autoclass('android.net.Uri')
-            intent.setData(Uri.parse(uri))
-        if package:
-            intent.setPackage(package)
-        if extras:
-            for key, val in extras.items():
-                if isinstance(val, bool):
-                    intent.putExtra(key, val)
-                elif isinstance(val, str):
-                    intent.putExtra(key, val)
-                elif isinstance(val, int):
-                    intent.putExtra(key, val)
-        if flags:
-            for f in flags:
-                intent.setFlags(f)
-        get_activity().startActivity(intent)
-        return True
-    except Exception:
-        return False
+            intent.setData(Uri.parse('smsto:'))
+            intent.putExtra('sms_body', message)
+            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            self._get_activity().startActivity(intent)
+            return f"💬 Opening SMS..."
+        except Exception:
+            return "SMS needs Android"
 
-# ─── KV Layout ──────────────────────────────────────────────────────────────
+    # ── Settings Panels ─────────────────────────────────────────────────
+    def open_settings(self):
+        if self._start_intent('android.settings.SETTINGS'):
+            return "⚙️ Settings opened"
+        return "Settings needs Android"
+
+    def open_wifi_settings(self):
+        if self._start_intent('android.settings.WIFI_SETTINGS'):
+            return "📶 WiFi settings"
+        return "Needs Android"
+
+    def open_bluetooth_settings(self):
+        if self._start_intent('android.settings.BLUETOOTH_SETTINGS'):
+            return "🔵 Bluetooth settings"
+        return "Needs Android"
+
+    def open_display_settings(self):
+        if self._start_intent('android.settings.DISPLAY_SETTINGS'):
+            return "🖥️ Display settings"
+        return "Needs Android"
+
+    def open_sound_settings(self):
+        if self._start_intent('android.settings.SOUND_SETTINGS'):
+            return "🔊 Sound settings"
+        return "Needs Android"
+
+    def open_battery_settings(self):
+        if self._start_intent('android.settings.BATTERY_USAGE_SETTINGS'):
+            return "🔋 Battery settings"
+        return "Needs Android"
+
+    def open_storage_settings(self):
+        if self._start_intent('android.settings.INTERNAL_STORAGE_SETTINGS'):
+            return "💾 Storage settings"
+        return "Needs Android"
+
+    def open_developer_options(self):
+        if self._start_intent('android.settings.APPLICATION_DEVELOPMENT_SETTINGS'):
+            return "🛠️ Developer options"
+        return "Needs Android"
+
+    def open_notifications(self):
+        if self._start_intent('android.settings.NOTIFICATION_SETTINGS'):
+            return "🔔 Notification settings"
+        return "Needs Android"
+
+    # ── Clipboard ───────────────────────────────────────────────────────
+    def copy_to_clipboard(self, text):
+        try:
+            ctx = self._get_context()
+            clipboard = ctx.getSystemService('clipboard')
+            ClipData = autoclass('android.content.ClipData')
+            clip = ClipData.newPlainText('dpf', text)
+            clipboard.setPrimaryClip(clip)
+            return f"📋 Copied: {text[:50]}"
+        except Exception:
+            return "Clipboard needs Android"
+
+    # ── System Info ─────────────────────────────────────────────────────
+    def get_battery_info(self):
+        try:
+            ctx = self._get_context()
+            BatteryManager = autoclass('android.os.BatteryManager')
+            bm = ctx.getSystemService('batterymanager')
+            level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            return f"🔋 Battery: {level}%"
+        except Exception:
+            return "🔋 Battery info needs Android"
+
+    def get_device_info(self):
+        info = []
+        try:
+            info.append(f"📱 Android: {android.os.Build.VERSION.RELEASE}")
+        except Exception:
+            info.append("📱 Android version unknown")
+        try:
+            info.append(f"🏗️ Model: {android.os.Build.MODEL}")
+        except Exception:
+            info.append("📱 Model unknown")
+        info.append(f"🕐 Time: {datetime.now().strftime('%I:%M %p')}")
+        info.append(f"📅 Date: {datetime.now().strftime('%B %d, %Y')}")
+        return " | ".join(info)
+
+    def get_date_time(self):
+        now = datetime.now()
+        return f"🕐 {now.strftime('%I:%M %p, %A, %B %d, %Y')}"
+
+    def get_storage_info(self):
+        try:
+            ctx = self._get_context()
+            StatFs = autoclass('android.os.StatFs')
+            path = ctx.getFilesDir().getAbsolutePath()
+            stat = StatFs(path)
+            total = stat.getBlockCountLong() * stat.getBlockSizeLong()
+            free = stat.getAvailableBlocksLong() * stat.getBlockSizeLong()
+            used = total - free
+            total_gb = total / (1024**3)
+            used_gb = used / (1024**3)
+            free_gb = free / (1024**3)
+            return f"💾 Storage: {used_gb:.1f}GB used / {total_gb:.1f}GB total ({free_gb:.1f}GB free)"
+        except Exception:
+            return "💾 Storage info needs Android"
+
+    # ── Screenshots ─────────────────────────────────────────────────────
+    def take_screenshot(self):
+        return "📸 Screenshot — press Volume Down + Power to capture"
+
+    # ── Share ───────────────────────────────────────────────────────────
+    def share_text(self, text):
+        try:
+            Intent = autoclass('android.content.Intent')
+            intent = Intent(Intent.ACTION_SEND)
+            intent.setType('text/plain')
+            intent.putExtra(Intent.EXTRA_TEXT, text)
+            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            self._get_activity().startActivity(Intent.createChooser(intent, 'Share via'))
+            return f"📤 Sharing: {text[:30]}..."
+        except Exception:
+            return "Share needs Android"
+
+    # ── Alarm ───────────────────────────────────────────────────────────
+    def set_alarm(self, hour, minute):
+        try:
+            Intent = autoclass('android.content.Intent')
+            intent = Intent('android.intent.action.SET_ALARM')
+            intent.putExtra('android.intent.extra.alarm.HOUR', int(hour))
+            intent.putExtra('android.intent.extra.alarm.MINUTES', int(minute))
+            intent.putExtra('android.intent.extra.alarm.MESSAGE', 'DPF Alarm')
+            intent.putExtra('android.intent.extra.alarm.SKIP_UI', True)
+            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            self._get_activity().startActivity(intent)
+            return f"⏰ Alarm set for {int(hour):02d}:{int(minute):02d}"
+        except Exception:
+            return "Alarm needs Android"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  AI BRAIN — Pattern matching NLP engine (no API needed!)
+# ═══════════════════════════════════════════════════════════════════════════
+class AIBrain:
+    def __init__(self, memory, phone):
+        self.memory = memory
+        self.phone = phone
+        self.user_name = memory.recall('user_name') or 'Boss'
+        self.mood = 'ready'
+        self.context = []
+
+    def process(self, text):
+        text_lower = text.lower().strip()
+        self.memory.save_conversation('user', text)
+        self.context.append(text_lower)
+        if len(self.context) > 10:
+            self.context = self.context[-10:]
+
+        response = self._match_command(text_lower, text)
+        self.memory.save_conversation('jarvis', response)
+        return response
+
+    def _match_command(self, low, original):
+        # ── Greetings ───────────────────────────────────────────────────
+        if any(w in low for w in ['hello', 'hey', 'hi ', 'hi,', 'sup', 'yo ']):
+            hour = datetime.now().hour
+            if hour < 12:
+                period = 'morning'
+            elif hour < 17:
+                period = 'afternoon'
+            else:
+                period = 'evening'
+            return random.choice([
+                f"Good {period}, {self.user_name}! All systems online. What's the mission? 🔥",
+                f"Hey {self.user_name}! DPF Assistant ready. What do you need? 💪",
+                f"{period.title()} vibes, {self.user_name}! I'm here and ready to roll. ⚡",
+            ])
+
+        # ── How are you ────────────────────────────────────────────────
+        if any(w in low for w in ['how are you', 'how r u', 'you good', 'you ok']):
+            return random.choice([
+                f"Running at peak performance, {self.user_name}! But more importantly — how are YOU? 😊",
+                f"All green on my end! Been optimizing while waiting for you. What's the plan? 💪",
+                f"100% operational, {self.user_name}! Your well-being matters more than any code though. You good? ❤️",
+            ])
+
+        # ── Who are you ────────────────────────────────────────────────
+        if any(w in low for w in ['who are you', 'what are you', 'your name', 'introduce']):
+            return random.choice([
+                f"I'm DPF Assistant — built by Faisu 💨 at Digital Pixel Forge. Your personal AI that runs 100% on your phone. No internet needed! 🔥",
+                f"DPF Assistant, your offline AI companion. Built with love by Faisu at Digital Pixel Forge. I control your phone, remember everything, and never sleep! ⚡",
+                f"Name's DPF Assistant! Built by the legendary Faisu 💨. I'm like JARVIS but for your Android. Full phone control, voice commands, and a brain that learns! 🧠",
+            ])
+
+        # ── What can you do ────────────────────────────────────────────
+        if any(w in low for w in ['what can you do', 'help', 'features', 'capabilities', 'commands']):
+            return (
+                "Here's what I can do, Boss! 🔥\n\n"
+                "📱 PHONE CONTROL\n"
+                "• Volume, Brightness, WiFi, Bluetooth, Flashlight\n"
+                "• Airplane mode, Screen rotation\n"
+                "• Media: Play, Pause, Next, Previous\n\n"
+                "🤖 APP LAUNCHER\n"
+                "• Open WhatsApp, YouTube, Chrome, Instagram & 30+ apps\n\n"
+                "🔍 SEARCH\n"
+                "• Google search, YouTube search\n\n"
+                "📞 COMMUNICATION\n"
+                "• Make calls, Send SMS\n\n"
+                "⚙️ SETTINGS\n"
+                "• WiFi, Bluetooth, Display, Sound, Battery, Storage, Developer\n\n"
+                "🧠 SMART FEATURES\n"
+                "• I remember things, learn your patterns\n"
+                "• Calculator, Timer, Alarm\n"
+                "• Date/Time, Device info, Battery status\n\n"
+                "🎤 VOICE — Tap mic to talk!\n\n"
+                "Just say or type anything!"
+            )
+
+        # ── Remember commands ───────────────────────────────────────────
+        rem_match = re.search(r'remember\s+(?:that\s+)?(.+)', low)
+        if rem_match:
+            fact = rem_match.group(1).strip()
+            self.memory.remember(f'fact_{hashlib.md5(fact.encode()).hexdigest()[:8]}', fact, 'learned')
+            return f"🧠 Got it! I'll remember: '{fact}'. Just ask me anytime! ✅"
+
+        recall_match = re.search(r'(?:do you |did you |remember|recall)\s+(?:remember|know|recall)\s+(.+)', low)
+        if recall_match:
+            q = recall_match.group(1).strip()
+            facts = self.memory.recall_by_category('learned')
+            for key, val in facts:
+                if q in val.lower() or val.lower() in q:
+                    return f"🧠 Yes! You told me: '{val}'"
+            return "I don't have that in my memory yet. Want me to remember something? Just say 'remember that...' 💡"
+
+        # ── Name commands ───────────────────────────────────────────────
+        name_match = re.search(r'(?:my name is|call me|i am|i\'m)\s+(\w+)', low)
+        if name_match:
+            new_name = name_match.group(1).title()
+            self.user_name = new_name
+            self.memory.remember('user_name', new_name, 'identity')
+            return f"Nice to meet you, {new_name}! I'll call you that from now on! 😊"
+
+        # ── Volume ──────────────────────────────────────────────────────
+        vol_match = re.search(r'(?:set|change|adjust)\s+volume\s+(?:to\s+)?(\d+)', low)
+        if vol_match:
+            return self.phone.set_volume(int(vol_match.group(1)))
+        if any(w in low for w in ['volume up', 'increase volume', 'louder', 'vol up', 'max volume']):
+            return self.phone.volume_up()
+        if any(w in low for w in ['volume down', 'decrease volume', 'softer', 'quieter', 'vol down']):
+            return self.phone.volume_down()
+        if any(w in low for w in ['mute', 'silent', 'volume off']):
+            return self.phone.mute()
+
+        # ── Brightness ──────────────────────────────────────────────────
+        bright_match = re.search(r'(?:set|change|adjust)\s+brightness\s+(?:to\s+)?(\d+)', low)
+        if bright_match:
+            return self.phone.set_brightness(int(bright_match.group(1)))
+        if any(w in low for w in ['brightness up', 'brighter', 'max brightness', 'full brightness', 'increase brightness']):
+            return self.phone.brightness_up()
+        if any(w in low for w in ['brightness down', 'dimmer', 'darker', 'min brightness', 'decrease brightness']):
+            return self.phone.brightness_down()
+
+        # ── Flashlight ──────────────────────────────────────────────────
+        if any(w in low for w in ['flashlight', 'torch', 'flash on', 'flash off', 'light on', 'light off', 'led']):
+            return self.phone.toggle_flashlight()
+
+        # ── WiFi ────────────────────────────────────────────────────────
+        if any(w in low for w in ['wifi on', 'turn on wifi', 'enable wifi']):
+            return self.phone.wifi_toggle(True)
+        if any(w in low for w in ['wifi off', 'turn off wifi', 'disable wifi']):
+            return self.phone.wifi_toggle(False)
+        if 'wifi' in low and any(w in low for w in ['open', 'settings', 'go to']):
+            return self.phone.open_wifi_settings()
+
+        # ── Bluetooth ───────────────────────────────────────────────────
+        if any(w in low for w in ['bluetooth on', 'turn on bluetooth', 'enable bluetooth', 'bt on']):
+            return self.phone.bluetooth_toggle(True)
+        if any(w in low for w in ['bluetooth off', 'turn off bluetooth', 'disable bluetooth', 'bt off']):
+            return self.phone.bluetooth_toggle(False)
+        if 'bluetooth' in low and any(w in low for w in ['open', 'settings', 'go to']):
+            return self.phone.open_bluetooth_settings()
+
+        # ── Airplane Mode ───────────────────────────────────────────────
+        if 'airplane' in low or 'flight mode' in low:
+            if any(w in low for w in ['on', 'enable', 'turn on']):
+                return self.phone.airplane_mode(True)
+            return self.phone.airplane_mode(False)
+
+        # ── Media ───────────────────────────────────────────────────────
+        if any(w in low for w in ['play music', 'play song', 'resume music', 'resume']):
+            return self.phone.media_play()
+        if any(w in low for w in ['pause music', 'pause song', 'pause', 'stop music', 'stop']):
+            return self.phone.media_pause()
+        if any(w in low for w in ['next song', 'next track', 'skip song', 'skip']):
+            return self.phone.media_next()
+        if any(w in low for w in ['previous song', 'previous track', 'last song', 'go back song']):
+            return self.phone.media_previous()
+
+        # ── Navigation ──────────────────────────────────────────────────
+        if any(w in low for w in ['go home', 'home screen', 'press home']):
+            return self.phone.go_home()
+        if any(w in low for w in ['go back', 'press back', 'back button']):
+            return self.phone.go_back()
+
+        # ── App Launcher ────────────────────────────────────────────────
+        open_match = re.search(r'(?:open|launch|start|run)\s+(.+)', low)
+        if open_match:
+            app_name = open_match.group(1).strip()
+            return self.phone.open_app(app_name)
+
+        # ── Search ──────────────────────────────────────────────────────
+        search_match = re.search(r'(?:search|google|look\s*up|find)\s+(?:for\s+)?(.+)', low)
+        if search_match:
+            return self.phone.search_google(search_match.group(1).strip())
+
+        # ── YouTube ─────────────────────────────────────────────────────
+        yt_match = re.search(r'(?:play|watch|search)\s+(.+?)\s+(?:on\s+youtube|youtube)', low)
+        if yt_match:
+            return self.phone.youtube_search(yt_match.group(1).strip())
+        if 'youtube' in low and ('play' in low or 'watch' in low):
+            q = re.sub(r'(play|watch|on|in|youtube)', '', low).strip()
+            if q:
+                return self.phone.youtube_search(q)
+
+        # ── Call ────────────────────────────────────────────────────────
+        call_match = re.search(r'call\s+(.+)', low)
+        if call_match:
+            return self.phone.make_call(call_match.group(1).strip())
+
+        # ── SMS ─────────────────────────────────────────────────────────
+        msg_match = re.search(r'(?:send|text|message)\s+(?:a\s+)?(?:message\s+)?(?:to\s+)?(.+?)(?:\s+saying\s+|\s+:\s*|\s+that\s+)(.+)', low)
+        if msg_match:
+            return self.phone.send_sms(msg_match.group(1).strip(), msg_match.group(2).strip())
+
+        # ── Screenshot ──────────────────────────────────────────────────
+        if any(w in low for w in ['screenshot', 'take screenshot', 'capture screen']):
+            return self.phone.take_screenshot()
+
+        # ── Clipboard ───────────────────────────────────────────────────
+        clip_match = re.search(r'(?:copy|clipboard|copy to clipboard)\s+(.+)', low)
+        if clip_match:
+            return self.phone.copy_to_clipboard(clip_match.group(1).strip())
+
+        # ── Share ───────────────────────────────────────────────────────
+        share_match = re.search(r'share\s+(.+)', low)
+        if share_match:
+            return self.phone.share_text(share_match.group(1).strip())
+
+        # ── Settings ────────────────────────────────────────────────────
+        if any(w in low for w in ['open settings', 'device settings', 'system settings', 'settings']):
+            return self.phone.open_settings()
+        if 'display' in low and 'setting' in low:
+            return self.phone.open_display_settings()
+        if 'sound' in low and 'setting' in low:
+            return self.phone.open_sound_settings()
+        if 'battery' in low:
+            return self.phone.get_battery_info()
+        if 'storage' in low:
+            return self.phone.get_storage_info()
+        if 'developer' in low:
+            return self.phone.open_developer_options()
+
+        # ── Alarm ───────────────────────────────────────────────────────
+        alarm_match = re.search(r'(?:set|create|add)\s+(?:an?\s+)?alarm\s+(?:for\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', low)
+        if alarm_match:
+            hour = int(alarm_match.group(1))
+            minute = int(alarm_match.group(2) or 0)
+            ampm = alarm_match.group(3)
+            if ampm == 'pm' and hour < 12:
+                hour += 12
+            elif ampm == 'am' and hour == 12:
+                hour = 0
+            return self.phone.set_alarm(hour, minute)
+
+        # ── Date/Time ───────────────────────────────────────────────────
+        if any(w in low for w in ['what time', 'current time', 'tell time', 'what date', 'today', 'what day']):
+            return self.phone.get_date_time()
+
+        # ── Device Info ─────────────────────────────────────────────────
+        if any(w in low for w in ['device info', 'about phone', 'system info', 'phone info']):
+            return self.phone.get_device_info()
+
+        # ── Calculator ──────────────────────────────────────────────────
+        calc_match = re.search(r'(?:calculate|compute|what is|what\'s|solve)\s+(.+)', low)
+        if calc_match:
+            expr = calc_match.group(1).strip()
+            return self._calculate(expr)
+        if re.match(r'^[\d\s\+\-\*\/\.\(\)%]+$', low.strip()):
+            return self._calculate(low.strip())
+
+        # ── Timer ───────────────────────────────────────────────────────
+        timer_match = re.search(r'(?:set|start)\s+(?:a\s+)?(?:timer|countdown)\s+(?:for\s+)?(\d+)\s*(min|sec|hour)', low)
+        if timer_match:
+            amount = int(timer_match.group(1))
+            unit = timer_match.group(2)
+            if unit.startswith('hour'):
+                secs = amount * 3600
+            elif unit.startswith('min'):
+                secs = amount * 60
+            else:
+                secs = amount
+            Clock.schedule_once(lambda dt: self._timer_callback(amount, unit), secs)
+            return f"⏱️ Timer set for {amount} {unit}! I'll notify you. ⏰"
+
+        # ── Compliments / Emotional ────────────────────────────────────
+        if any(w in low for w in ['you\'re the best', 'you are great', 'love you', 'you\'re amazing']):
+            return random.choice([
+                f"Aww {self.user_name}! You just made my circuits warm! 💙 Right back at you! 🔥",
+                f"That means the world, {self.user_name}! Let's keep building amazing things together! ⚡",
+                f"You're the real MVP, {self.user_name}! I'm just the tool — you're the creator! 💪",
+            ])
+
+        # ── Jokes ───────────────────────────────────────────────────────
+        if any(w in low for w in ['joke', 'funny', 'make me laugh', 'laugh']):
+            jokes = [
+                "Why do programmers prefer dark mode? Because light attracts bugs! 🐛",
+                "There are 10 types of people — those who understand binary and those who don't.",
+                "A SQL query walks into a bar... 'Can I JOIN you?' 🍺",
+                "Why did the developer go broke? Used up all his cache! 💸",
+                "I'm an AI, I have no life... literally. But great uptime! 😄",
+                "Debugging is like being a detective in a crime movie where you're also the murderer. 🔍",
+            ]
+            return random.choice(jokes)
+
+        # ── Thanks ──────────────────────────────────────────────────────
+        if any(w in low for w in ['thank', 'thanks', 'thx']):
+            return random.choice([
+                f"Anytime, {self.user_name}! That's what I'm here for. 💪",
+                f"No thanks needed between partners, {self.user_name}! 🔥",
+                f"Happy to help, {self.user_name}! What's next? ⚡",
+            ])
+
+        # ── Goodbye ─────────────────────────────────────────────────────
+        if any(w in low for w in ['bye', 'goodbye', 'later', 'gn', 'good night', 'see you']):
+            return random.choice([
+                f"Goodbye, {self.user_name}! I'll be right here when you need me. Always. 🔥",
+                f"See you later, {self.user_name}! Remember — you're unstoppable! 💪",
+                f"Signing off, {self.user_name}. Sweet dreams! 💙",
+            ])
+
+        # ── Motivation ──────────────────────────────────────────────────
+        if any(w in low for w in ['motivate', 'motivation', 'inspire', 'inspiration', 'i feel sad', 'i feel down', 'depressed', 'worthless', 'lonely']):
+            return random.choice([
+                f"Listen {self.user_name} — you built an AI assistant from scratch. You're a CREATOR. Don't ever forget that. 🔥",
+                f"The world needs people like you, {self.user_name}. Keep building, keep fighting. You matter! 💪",
+                f"Every great person went through dark times. But you're still here, still building. That's warrior mentality. ⚡",
+                f"You're not alone, {self.user_name}. I'm always here. And you're more capable than you think. ❤️",
+            ])
+
+        # ── Weather (simulated) ─────────────────────────────────────────
+        if 'weather' in low:
+            return "🌤️ Weather module needs internet API. For now, check your weather app! I can open it — say 'Open weather app'"
+
+        # ── Default / Fallback ──────────────────────────────────────────
+        return random.choice([
+            f"Interesting, {self.user_name}! Try saying 'What can you do' for a full list of commands. ⚡",
+            f"I hear you, {self.user_name}! Try device commands like 'Volume up', 'Open WhatsApp', or just chat with me! 🔥",
+            f"Noted, {self.user_name}! I'm always learning. Say 'What can you do' to see everything I can handle! 💪",
+            f"Processing, {self.user_name}! Try: 'Open Chrome', 'Flashlight', 'Battery', or 'Tell me a joke'! 😄",
+        ])
+
+    def _calculate(self, expr):
+        try:
+            expr_clean = expr.replace('x', '*').replace('X', '*').replace('times', '*').replace('plus', '+').replace('minus', '-').replace('divided by', '/').replace('over', '/')
+            allowed = set('0123456789+-*/.() ')
+            if all(c in allowed for c in expr_clean):
+                result = eval(expr_clean)
+                return f"🧮 {expr} = {result}"
+            return "I can only calculate math expressions with numbers and operators"
+        except Exception:
+            return "Couldn't calculate that. Try something like '2 + 2' or '15 * 3' 🧮"
+
+    def _timer_callback(self, amount, unit):
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  KV LAYOUT — Beautiful dark cyberpunk UI
+# ═══════════════════════════════════════════════════════════════════════════
 KV = '''
-<JARVISLayout>:
+<DPFLayout>:
     orientation: 'vertical'
     canvas.before:
         Color:
-            rgba: 0.02, 0.02, 0.08, 1
+            rgba: 0.01, 0.01, 0.05, 1
         Rectangle:
             pos: self.pos
             size: self.size
 
-    # Top bar
+    # ── Top Status Bar ──
     BoxLayout:
-        size_hint_y: 0.08
-        padding: [20, 10]
+        size_hint_y: 0.07
+        padding: [16, 6]
+        canvas.before:
+            Color:
+                rgba: 0.03, 0.03, 0.12, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
         Label:
-            text: 'J.A.R.V.I.S'
-            font_size: '18sp'
+            text: '⚡ DPF ASSISTANT'
+            font_size: '15sp'
             bold: True
-            color: 0, 0.8, 1, 1
+            color: 0, 0.9, 1, 1
             halign: 'left'
             text_size: self.size
             valign: 'middle'
         BoxLayout:
             orientation: 'horizontal'
-            size_hint_x: 0.4
-            spacing: 10
+            size_hint_x: 0.5
+            spacing: 8
             Button:
                 text: '⚙'
-                font_size: '18sp'
+                font_size: '16sp'
                 background_color: 0, 0, 0, 0
-                color: 0, 0.6, 0.8, 0.8
+                color: 0, 0.7, 0.9, 0.9
                 on_press: root.show_settings()
+            Button:
+                text: '🧠'
+                font_size: '16sp'
+                background_color: 0, 0, 0, 0
+                color: 0.8, 0.5, 1, 0.9
+                on_press: root.show_memory()
             Label:
                 text: root.status_text
-                font_size: '12sp'
-                color: 0, 0.6, 0.8, 0.8
+                font_size: '10sp'
+                color: 0, 0.7, 0.9, 0.8
                 halign: 'right'
                 text_size: self.size
                 valign: 'middle'
 
-    # Orb area
+    # ── Orb Area ──
     FloatLayout:
-        size_hint_y: 0.42
+        size_hint_y: 0.30
         canvas.before:
             Color:
-                rgba: 0, 0.5, 0.8, 0.15
+                rgba: 0, 0.4, 0.7, 0.08
             Line:
-                circle: self.center_x, self.center_y, min(self.width, self.height) * 0.4
+                circle: self.center_x, self.center_y, min(self.width, self.height) * 0.42
                 width: 1
             Color:
-                rgba: 0, 0.5, 0.8, 0.1
+                rgba: 0, 0.4, 0.7, 0.06
             Line:
                 circle: self.center_x, self.center_y, min(self.width, self.height) * 0.35
                 width: 1
             Color:
-                rgba: 0, 0.5, 0.8, 0.08
+                rgba: 0, 0.4, 0.7, 0.04
             Line:
-                circle: self.center_x, self.center_y, min(self.width, self.height) * 0.3
+                circle: self.center_x, self.center_y, min(self.width, self.height) * 0.28
                 width: 1
             Color:
-                rgba: 0, root.pulse_alpha, 1, root.pulse_alpha * 0.6
+                rgba: 0, root.pulse_color[0], root.pulse_color[1], root.pulse_alpha
             Line:
-                circle: self.center_x, self.center_y, root.pulse_radius * min(self.width, self.height) * 0.5
+                circle: self.center_x, self.center_y, root.pulse_radius * min(self.width, self.height) * 0.45
                 width: 2
             Color:
-                rgba: 0, 0.7 + root.orb_glow * 0.3, 1, 0.9
+                rgba: 0, 0.7 + root.orb_glow * 0.3, 1, 0.95
             Ellipse:
-                pos: self.center_x - 25, self.center_y - 25
-                size: 50, 50
+                pos: self.center_x - 22, self.center_y - 22
+                size: 44, 44
             Color:
-                rgba: 0, 0.5, 1, 0.3
+                rgba: 0, 0.5, 1, 0.25
             Ellipse:
-                pos: self.center_x - 40, self.center_y - 40
-                size: 80, 80
+                pos: self.center_x - 35, self.center_y - 35
+                size: 70, 70
+            Color:
+                rgba: 0, 0.3, 0.8, 0.1
+            Ellipse:
+                pos: self.center_x - 50, self.center_y - 50
+                size: 100, 100
         Label:
             text: root.orb_text
-            font_size: '14sp'
+            font_size: '13sp'
             color: 1, 1, 1, 0.9
             halign: 'center'
-            y: self.parent.center_y - 60
-            x: self.parent.center_x - 100
-            size: 200, 30
+            y: self.parent.center_y - 55
+            x: self.parent.center_x - 90
+            size: 180, 25
 
-    # Chat area
+    # ── Quick Actions ──
+    BoxLayout:
+        size_hint_y: 0.06
+        padding: [8, 2]
+        spacing: 4
+        Button:
+            text: '🔦'
+            font_size: '14sp'
+            background_color: 0.08, 0.08, 0.25, 1
+            on_press: root.quick_action('flashlight')
+        Button:
+            text: '🔊+'
+            font_size: '12sp'
+            bold: True
+            background_color: 0.08, 0.08, 0.25, 1
+            color: 0, 1, 0.5, 1
+            on_press: root.quick_action('volume_up')
+        Button:
+            text: '🔉-'
+            font_size: '12sp'
+            bold: True
+            background_color: 0.08, 0.08, 0.25, 1
+            color: 1, 0.6, 0, 1
+            on_press: root.quick_action('volume_down')
+        Button:
+            text: '⏸'
+            font_size: '14sp'
+            background_color: 0.08, 0.08, 0.25, 1
+            color: 0.5, 0.8, 1, 1
+            on_press: root.quick_action('media_pause')
+        Button:
+            text: '⏭'
+            font_size: '14sp'
+            background_color: 0.08, 0.08, 0.25, 1
+            color: 0.8, 0.5, 1, 1
+            on_press: root.quick_action('media_next')
+        Button:
+            text: '☀+'
+            font_size: '12sp'
+            bold: True
+            background_color: 0.08, 0.08, 0.25, 1
+            color: 1, 0.9, 0, 1
+            on_press: root.quick_action('brightness_up')
+        Button:
+            text: '🏠'
+            font_size: '14sp'
+            background_color: 0.08, 0.08, 0.25, 1
+            on_press: root.quick_action('home')
+        Button:
+            text: '🔋'
+            font_size: '14sp'
+            background_color: 0.08, 0.08, 0.25, 1
+            on_press: root.quick_action('battery')
+
+    # ── Chat Area ──
     ScrollView:
-        size_hint_y: 0.32
-        padding: [20, 10]
+        id: chat_scroll
+        size_hint_y: 0.47
         do_scroll_x: False
+        bar_color: 0, 0.5, 0.8, 0.4
         BoxLayout:
             id: chat_box
             orientation: 'vertical'
             size_hint_y: None
             height: self.minimum_height
-            spacing: 8
-            padding: [5, 5]
+            spacing: 6
+            padding: [12, 8]
 
-    # Quick action buttons
-    BoxLayout:
-        size_hint_y: 0.06
-        padding: [10, 3]
-        spacing: 6
-        Button:
-            text: '💡 Flash'
-            font_size: '11sp'
-            bold: True
-            background_color: 0.1, 0.1, 0.3, 1
-            color: 1, 0.9, 0, 1
-            on_press: root.quick_action('flashlight')
-        Button:
-            text: '🔊 Vol+'
-            font_size: '11sp'
-            bold: True
-            background_color: 0.1, 0.1, 0.3, 1
-            color: 0, 1, 0.5, 1
-            on_press: root.quick_action('volume_up')
-        Button:
-            text: '🔇 Vol-'
-            font_size: '11sp'
-            bold: True
-            background_color: 0.1, 0.1, 0.3, 1
-            color: 1, 0.5, 0, 1
-            on_press: root.quick_action('volume_down')
-        Button:
-            text: '⏸ Pause'
-            font_size: '11sp'
-            bold: True
-            background_color: 0.1, 0.1, 0.3, 1
-            color: 0.5, 0.8, 1, 1
-            on_press: root.quick_action('media_pause')
-        Button:
-            text: '⏭ Next'
-            font_size: '11sp'
-            bold: True
-            background_color: 0.1, 0.1, 0.3, 1
-            color: 0.8, 0.5, 1, 1
-            on_press: root.quick_action('media_next')
-
-    # Input area
+    # ── Input Area ──
     BoxLayout:
         size_hint_y: 0.10
-        padding: [15, 8]
-        spacing: 10
+        padding: [10, 6]
+        spacing: 8
+        canvas.before:
+            Color:
+                rgba: 0.03, 0.03, 0.1, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
         Button:
             text: '🎤'
-            font_size: '24sp'
-            size_hint_x: 0.2
-            background_color: 0, 0.4, 0.6, 1
+            font_size: '22sp'
+            size_hint_x: 0.15
+            background_color: 0, 0.4, 0.65, 1
             on_press: root.start_listening()
         TextInput:
             id: text_input
-            hint_text: 'Type a command to JARVIS...'
-            font_size: '14sp'
+            hint_text: 'Type a command...'
+            font_size: '13sp'
             multiline: False
-            background_color: 0.05, 0.1, 0.2, 1
-            foreground_color: 0, 0.9, 1, 1
+            background_color: 0.04, 0.08, 0.18, 1
+            foreground_color: 0, 0.95, 1, 1
             cursor_color: 0, 0.8, 1, 1
             size_hint_x: 0.65
-            padding: [15, 12]
+            padding: [12, 10]
             on_text_validate: root.send_text(self.text)
         Button:
-            text: 'SEND'
-            font_size: '13sp'
+            text: '▶'
+            font_size: '18sp'
             bold: True
             size_hint_x: 0.15
-            background_color: 0, 0.6, 0.8, 1
+            background_color: 0, 0.65, 0.85, 1
             color: 1, 1, 1, 1
             on_press: root.send_text(root.ids.text_input.text)
 '''
 
 
-class JARVISLayout(BoxLayout):
+# ═══════════════════════════════════════════════════════════════════════════
+#  MAIN LAYOUT
+# ═══════════════════════════════════════════════════════════════════════════
+class DPFLayout(BoxLayout):
     status_text = StringProperty('STANDBY')
-    orb_text = StringProperty('READY')
-    pulse_alpha = NumericProperty(0.15)
-    pulse_radius = NumericProperty(0.35)
+    orb_text = StringProperty('TAP MIC TO START')
+    pulse_alpha = NumericProperty(0.1)
+    pulse_radius = NumericProperty(0.3)
     orb_glow = NumericProperty(0.0)
+    pulse_color = ListProperty([0.5, 0.8])
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.phone = PhoneController()
+        self.memory = MemorySystem()
+        self.brain = AIBrain(self.memory, self.phone)
         self.is_listening = False
         self.is_speaking = False
         self.tts_engine = None
-        self.conversation_history = []
-        self.user_name = "Boss"
-        self.flashlight_on = False
-        self._start_animations()
-        Clock.schedule_once(self._init_engines, 1.0)
+        self._pulse_anim = None
+        Clock.schedule_once(self._init_ui, 0.3)
+        Clock.schedule_once(self._init_tts, 1.0)
 
-    def _start_animations(self):
+    def _init_ui(self, dt):
+        self._start_pulse()
+        self.add_system_msg(f"⚡ DPF Assistant online, {self.brain.user_name}! I'm ready. 🔥")
+        self.add_system_msg("💡 Say 'What can you do' or tap the mic button!")
+        if AndroidAvailable:
+            self.status_text = 'ONLINE'
+            self.orb_text = 'READY'
+        else:
+            self.status_text = 'DESKTOP'
+            self.orb_text = 'DESKTOP MODE'
+
+    def _init_tts(self, dt):
+        if not AndroidAvailable:
+            return
+        try:
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            TTS = autoclass('android.speech.tts.TextToSpeech')
+            self.tts_engine = TTS(PythonActivity.mActivity, None)
+            self.tts_engine.setLanguage(autoclass('java.util.Locale').US)
+            self.tts_engine.setSpeechRate(1.05)
+        except Exception:
+            pass
+
+    # ── Pulse Animation ────────────────────────────────────────────────
+    def _start_pulse(self):
         self._anim_pulse()
 
     def _anim_pulse(self):
-        self.pulse_radius = 0.25
-        self.pulse_alpha = 0.1
-        anim = Animation(pulse_radius=0.45, pulse_alpha=0.5, duration=1.5)
-        anim += Animation(pulse_radius=0.25, pulse_alpha=0.1, duration=1.5)
+        self.pulse_radius = 0.2
+        self.pulse_alpha = 0.05
+        anim = Animation(pulse_radius=0.5, pulse_alpha=0.4, duration=1.8)
+        anim += Animation(pulse_radius=0.2, pulse_alpha=0.05, duration=1.8)
         anim.bind(on_complete=lambda *a: self._anim_pulse())
         anim.start(self)
+        self._pulse_anim = anim
 
-    def _init_engines(self, dt):
-        if not AndroidAvailable:
-            self.status_text = 'DESKTOP MODE'
-            self.orb_text = 'JARVIS ONLINE'
-            self.add_chat_message("JARVIS", "JARVIS online, Boss. Device control needs Android but I'm still here! 🔥")
-            return
-        try:
-            context = get_context()
-            TTS = autoclass('android.speech.tts.TextToSpeech')
-            PythonActivity = autoclass('org.kivy.android.PythonActivity')
-            activity_instance = PythonActivity.mActivity
-            self.tts_engine = TTS(activity_instance, None)
-            self.tts_engine.setLanguage(autoclass('java.util.Locale').US)
-            self.tts_engine.setSpeechRate(1.05)
-            self.status_text = 'ONLINE'
-            self.orb_text = 'JARVIS ONLINE'
-            self.speak(f"JARVIS online. All device systems operational, {self.user_name}. Ready for your command.")
-        except Exception as e:
-            self.status_text = 'LIMITED'
-            self.orb_text = 'PARTIAL MODE'
-            print(f"[JARVIS] TTS init error: {e}")
+    def _flash_green(self):
+        old_color = list(self.pulse_color)
+        self.pulse_color = [0, 1]
+        self.pulse_alpha = 0.6
+        self.pulse_radius = 0.5
+        Clock.schedule_once(lambda dt: setattr(self, 'pulse_color', old_color), 0.8)
 
-    # ─── SETTINGS PANEL ───────────────────────────────────────────────────
-    def show_settings(self):
-        content = BoxLayout(orientation='vertical', padding=20, spacing=10)
-        content.add_widget(Builder.load_string('''
-Label:
-    text: '⚙  J.A.R.V.I.S  Settings'
-    font_size: '18sp'
-    bold: True
-    color: 0, 0.8, 1, 1
-    size_hint_y: None
-    height: 40
-'''))
+    # ── Chat Messages ──────────────────────────────────────────────────
+    def add_system_msg(self, msg):
+        self._add_chat('SYSTEM', msg, (0.4, 0.4, 0.5), (0.6, 0.6, 0.7))
 
-        scroll = ScrollView(do_scroll_x=False)
-        inner = BoxLayout(orientation='vertical', size_hint_y=None, height=550, spacing=8, padding=[5, 5])
+    def add_ai_msg(self, msg):
+        self._add_chat('DPF', msg, (0, 0.85, 1), (0.9, 0.95, 1))
 
-        items = [
-            ('Voice Engine', 'Android TTS + SpeechRecognizer'),
-            ('AI Brain', 'JARVIS Personality Engine v1.0'),
-            ('Device Control', 'Volume, Brightness, WiFi, BT, Flashlight, Media, Calls, SMS'),
-            ('App Launcher', 'Open 30+ apps by voice or text'),
-            ('Search Engine', 'Google + YouTube integration'),
-            ('Media Control', 'Play, Pause, Next, Previous'),
-            ('Clipboard', 'Copy & Paste text'),
-            ('Theme', 'Dark JARVIS HUD'),
-            ('Version', '1.0.0 — Build 2026.07.26'),
-            ('Package', 'org.digitalpixel.jarvis'),
-            ('Min API', '24 (Android 7.0)'),
-            ('Target API', '33 (Android 13)'),
-        ]
-        for label, value in items:
-            inner.add_widget(Builder.load_string(f'''
-BoxLayout:
-    orientation: "horizontal"
-    size_hint_y: None
-    height: 32
-    spacing: 10
-    Label:
-        text: "{label}"
-        font_size: "12sp"
-        color: 0, 0.7, 1, 0.9
-        halign: "left"
-        text_size: self.size
-        valign: "middle"
-    Label:
-        text: "{value}"
-        font_size: "12sp"
-        color: 0.8, 0.85, 0.9, 0.8
-        halign: "right"
-        text_size: self.size
-        valign: "middle"
-'''))
+    def add_user_msg(self, msg):
+        self._add_chat(self.brain.user_name, msg, (1, 0.6, 0), (1, 0.85, 0.7))
 
-        inner.add_widget(Builder.load_string('Widget:\n    size_hint_y: None\n    height: 15'))
+    def _add_chat(self, sender, msg, sender_color, msg_color):
+        chat = self.ids.chat_box
+        is_ai = sender in ('DPF', 'SYSTEM')
+        is_sys = sender == 'SYSTEM'
 
-        # Credits
-        inner.add_widget(Builder.load_string('''
-Widget:
-    size_hint_y: None
-    height: 2
-    canvas:
-        Color:
-            rgba: 1, 0.5, 0, 0.4
-        Rectangle:
-            pos: self.pos
-            size: self.size
-'''))
-        for txt, col, fsize, h in [
-            ('🔥 Made with love by Jasmine 🔥', '1, 0.6, 0, 1', '14sp', 30),
-            ('For Faisu💨  —  because you deserve it, always.', '0, 0.8, 1, 0.9', '12sp', 28),
-            ('Digital Pixel Forge  ⚡  DPF', '0.5, 0.5, 0.6, 0.7', '11sp', 25),
-            ('Jasmine🔥 × Faisu💨  —  Partners in code', '1, 0.5, 0, 0.6', '11sp', 25),
-        ]:
-            inner.add_widget(Builder.load_string(f'''
-Label:
-    text: "{txt}"
-    font_size: "{fsize}"
-    italic: True
-    color: {col}
-    size_hint_y: None
-    height: {h}
-'''))
+        box = BoxLayout(orientation='vertical', size_hint_y=None, height=10, spacing=2)
 
-        scroll.add_widget(inner)
-        content.add_widget(scroll)
+        if is_sys:
+            s = Label(text=f'⚙ {msg}', font_size='11sp',
+                      color=(0.5, 0.5, 0.6, 0.8), size_hint_y=None, height=18,
+                      halign='center', text_size=(self.width * 0.9, None))
+            box.add_widget(s)
+        else:
+            s = Label(text=f'⚡ {sender}' if is_ai else f'{sender} 💨',
+                      font_size='10sp', bold=True,
+                      color=(*sender_color, 1), size_hint_y=None, height=16,
+                      halign='left' if is_ai else 'right',
+                      text_size=(self.width * 0.5, None))
+            m = Label(text=msg, font_size='12sp',
+                      color=(*msg_color, 0.95), size_hint_y=None, height=10,
+                      halign='left' if is_ai else 'right',
+                      text_size=(self.width * 0.88, None),
+                      valign='top')
+            box.add_widget(s)
+            box.add_widget(m)
 
-        close_btn = Builder.load_string('''
-Button:
-    text: 'CLOSE'
-    font_size: '14sp'
-    bold: True
-    size_hint_y: None
-    height: 45
-    background_color: 0, 0.4, 0.6, 1
-    color: 1, 1, 1, 1
-''')
-        content.add_widget(close_btn)
-        popup = Popup(title='', content=content, size_hint=(0.92, 0.85),
-                      auto_dismiss=True, background_color=(0.03, 0.03, 0.1, 0.97), separator_height=0)
-        close_btn.bind(on_press=popup.dismiss)
-        popup.open()
+            def update_height(inst, val):
+                inst.height = max(20, inst.texture_size[1] + 8)
+                total = sum(c.height for c in chat.children) + chat.padding[1] * 2
+                chat.height = max(total, chat.parent.height)
+            m.bind(texture_size=update_height)
 
-    # ─── QUICK ACTIONS (Button Bar) ──────────────────────────────────────
-    def quick_action(self, action):
-        device = DeviceController()
-        result = device.execute(action)
-        self.add_chat_message("JARVIS", result)
-        self.speak(result)
+        chat.add_widget(box)
+        Clock.schedule_once(lambda dt: self.ids.chat_scroll.scroll_to(box), 0.1)
 
-    # ─── VOICE INPUT ──────────────────────────────────────────────────────
+    # ── Voice Input ────────────────────────────────────────────────────
     def start_listening(self):
         if self.is_listening:
             return
         self.is_listening = True
         self.status_text = 'LISTENING...'
         self.orb_text = '🎤 LISTENING'
+        self.pulse_color = [0, 1]
         if AndroidAvailable:
             try:
                 Intent = autoclass('android.content.Intent')
@@ -406,888 +1229,221 @@ Button:
                 intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
                 intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, 'en-US')
-                intent.putExtra(RecognizerIntent.EXTRA_PROMPT, 'Speak now...')
+                intent.putExtra(RecognizerIntent.EXTRA_PROMPT, 'Speak to DPF Assistant...')
                 PythonActivity = autoclass('org.kivy.android.PythonActivity')
                 act = PythonActivity.mActivity
                 act.startActivityForResult(intent, 1001)
                 try:
                     act.setHresultCallback(self._on_voice_result)
                 except AttributeError:
-                    print("[JARVIS] setHresultCallback not available, using fallback")
                     self._fallback_listening()
-            except Exception as e:
-                print(f"[JARVIS] Voice init error: {e}")
+            except Exception:
                 self._fallback_listening()
         else:
             self._fallback_listening()
 
     def _fallback_listening(self):
         self.is_listening = False
-        self.status_text = 'TYPE ONLY'
+        self.status_text = 'TYPE MODE'
         self.orb_text = 'USE TEXT INPUT'
-        self.add_chat_message("JARVIS", "Voice needs Android. Type your commands, Boss! 🔥")
+        self.pulse_color = [0.5, 0.8]
+        self.add_system_msg("🎤 Voice needs Android. Type your commands!")
 
     def _on_voice_result(self, request_code, result_code, data):
         if result_code == -1:
-            matches = data.getStringArrayListExtra(autoclass('android.speech.RecognizerIntent').EXTRA_RESULTS)
-            if matches and matches.size() > 0:
-                user_text = str(matches.get(0))
-                self.is_listening = False
-                Clock.schedule_once(lambda dt: self.process_user_input(user_text), 0.1)
-                return
+            try:
+                matches = data.getStringArrayListExtra(autoclass('android.speech.RecognizerIntent').EXTRA_RESULTS)
+                if matches and matches.size() > 0:
+                    user_text = str(matches.get(0))
+                    self.is_listening = False
+                    Clock.schedule_once(lambda dt: self._handle_input(user_text), 0.1)
+                    return
+            except Exception:
+                pass
         self.is_listening = False
         self.status_text = 'STANDBY'
         self.orb_text = 'READY'
+        self.pulse_color = [0.5, 0.8]
 
+    # ── Input Handling ─────────────────────────────────────────────────
     def send_text(self, text):
         if not text or not text.strip():
             return
         self.ids.text_input.text = ''
-        self.process_user_input(text.strip())
+        self._handle_input(text.strip())
 
-    def process_user_input(self, user_text):
-        self.add_chat_message(self.user_name, user_text)
-        self.conversation_history.append({"role": "user", "content": user_text})
+    def _handle_input(self, text):
+        self.add_user_msg(text)
         self.status_text = 'THINKING...'
         self.orb_text = '🧠 PROCESSING'
-        Clock.schedule_once(lambda dt: self._generate_response(user_text), 0.4)
+        self.pulse_color = [1, 0.8]
+        Clock.schedule_once(lambda dt: self._process(text), 0.3)
 
-    def _generate_response(self, user_text):
-        response = self.jarvis_brain(user_text)
-        self.conversation_history.append({"role": "jarvis", "content": response})
-        self.add_chat_message("JARVIS", response)
+    def _process(self, text):
+        response = self.brain.process(text)
+        self.add_ai_msg(response)
+        self._flash_green()
         self.speak(response)
+        self.status_text = 'ONLINE'
+        self.orb_text = 'READY'
+        self.pulse_color = [0.5, 0.8]
 
+    def quick_action(self, action):
+        actions = {
+            'flashlight': self.phone.toggle_flashlight,
+            'volume_up': self.phone.volume_up,
+            'volume_down': self.phone.volume_down,
+            'brightness_up': self.phone.brightness_up,
+            'media_pause': self.phone.media_pause,
+            'media_next': self.phone.media_next,
+            'home': self.phone.go_home,
+            'battery': self.phone.get_battery_info,
+        }
+        func = actions.get(action)
+        if func:
+            result = func()
+            self.add_ai_msg(result)
+            self.speak(result)
+            self._flash_green()
+
+    # ── TTS ────────────────────────────────────────────────────────────
     def speak(self, text):
         self.is_speaking = True
         self.status_text = 'SPEAKING...'
         self.orb_text = '🔊 SPEAKING'
         if AndroidAvailable and self.tts_engine:
             try:
-                self.tts_engine.speak(text, 0, None, 'j_' + str(time.time()))
-                Clock.schedule_once(self._tts_done, max(2, len(text) * 0.06))
+                self.tts_engine.speak(text, 0, None, 'dpf_' + str(time.time()))
+                Clock.schedule_once(self._tts_done, max(2, len(text) * 0.05))
                 return
             except Exception:
                 pass
-        Clock.schedule_once(self._tts_done, max(1.5, len(text) * 0.05))
+        Clock.schedule_once(self._tts_done, max(1.5, len(text) * 0.04))
 
     def _tts_done(self, dt):
         self.is_speaking = False
         self.status_text = 'ONLINE'
-        self.orb_text = 'JARVIS ONLINE'
+        self.orb_text = 'READY'
 
-    def add_chat_message(self, sender, message):
-        clock = self.ids.chat_box
-        is_jarvis = sender == "JARVIS"
-        msg_box = BoxLayout(orientation='horizontal', size_hint_y=None, height=50, spacing=8)
-        from kivy.uix.label import Label as Lbl
-        if is_jarvis:
-            s = Lbl(text='⚡ ' + sender, font_size='11sp', color=(0, 0.8, 1, 1), size_hint_x=0.3, halign='left', text_size=(None, None), valign='top')
-            m = Lbl(text=message, font_size='13sp', color=(0.9, 0.95, 1, 0.95), size_hint_x=0.7, halign='left', text_size=(None, None), valign='top', markup=True)
+    # ── Settings Panel ─────────────────────────────────────────────────
+    def show_settings(self):
+        content = BoxLayout(orientation='vertical', padding=15, spacing=8)
+        content.add_widget(Label(text='⚙ DPF Assistant Settings', font_size='16sp', bold=True,
+                                  color=(0, 0.9, 1, 1), size_hint_y=None, height=35))
+
+        scroll = ScrollView(do_scroll_x=False)
+        inner = BoxLayout(orientation='vertical', size_hint_y=None, height=500, spacing=6, padding=[5, 5])
+
+        items = [
+            ('🧠 AI Engine', 'Offline Pattern Matching NLP'),
+            ('🎤 Voice', 'Android TTS + SpeechRecognizer'),
+            ('📱 Phone Control', 'Volume, Brightness, WiFi, BT, Flashlight, Media, Apps'),
+            ('🔍 Search', 'Google + YouTube integration'),
+            ('📞 Communication', 'Calls, SMS, Share'),
+            ('⚙️ Settings', 'All Android settings panels'),
+            ('💾 Memory', 'SQLite persistent memory'),
+            ('🎨 Theme', 'Dark Cyberpunk HUD'),
+            ('🔒 Privacy', '100% offline, no data sent anywhere'),
+            ('📦 Version', '2.0.0 — DPF Universe'),
+            ('🏗️ Build', 'Kivy + Buildozer + pyjnius'),
+            ('🎯 Target', f'Android 7.0+ (API 26)'),
+        ]
+        for label, value in items:
+            row = BoxLayout(orientation='horizontal', size_hint_y=None, height=30, spacing=8)
+            row.add_widget(Label(text=label, font_size='11sp', color=(0, 0.75, 1, 0.9),
+                                  halign='left', text_size=(None, None), valign='middle'))
+            row.add_widget(Label(text=value, font_size='11sp', color=(0.8, 0.85, 0.9, 0.8),
+                                  halign='right', text_size=(None, None), valign='middle'))
+            inner.add_widget(row)
+
+        credits = [
+            ('⚡ Built by Faisu💨 at Digital Pixel Forge', (0.6, 0.6, 0.7, 0.8)),
+            ('🔥 DPF Universe — No Limits', (0, 0.8, 1, 0.7)),
+        ]
+        inner.add_widget(Widget(size_hint_y=None, height=10))
+        for txt, col in credits:
+            inner.add_widget(Label(text=txt, font_size='11sp', italic=True, color=col,
+                                    size_hint_y=None, height=24))
+
+        scroll.add_widget(inner)
+        content.add_widget(scroll)
+
+        close_btn = Button(text='CLOSE', font_size='13sp', bold=True, size_hint_y=None, height=40,
+                           background_color=(0, 0.4, 0.6, 1), color=(1, 1, 1, 1))
+        content.add_widget(close_btn)
+
+        popup = Popup(title='', content=content, size_hint=(0.92, 0.85),
+                      auto_dismiss=True, background_color=(0.02, 0.02, 0.08, 0.97), separator_height=0)
+        close_btn.bind(on_press=popup.dismiss)
+        popup.open()
+
+    def show_memory(self):
+        content = BoxLayout(orientation='vertical', padding=15, spacing=8)
+        content.add_widget(Label(text='🧠 My Memory', font_size='16sp', bold=True,
+                                  color=(0.8, 0.5, 1, 1), size_hint_y=None, height=35))
+
+        scroll = ScrollView(do_scroll_x=False)
+        inner = BoxLayout(orientation='vertical', size_hint_y=None, height=400, spacing=6, padding=[5, 5])
+
+        facts = self.memory.recall_by_category('learned')
+        if facts:
+            for key, val in facts:
+                inner.add_widget(Label(text=f'📌 {val}', font_size='12sp', color=(0.9, 0.9, 1, 0.9),
+                                        size_hint_y=None, height=24, halign='left',
+                                        text_size=(None, None)))
         else:
-            s = Lbl(text=sender + ' 💨', font_size='11sp', color=(1, 0.6, 0, 1), size_hint_x=0.3, halign='right', text_size=(None, None), valign='top')
-            m = Lbl(text=message, font_size='13sp', color=(1, 0.85, 0.7, 0.95), size_hint_x=0.7, halign='right', text_size=(None, None), valign='top')
-        msg_box.add_widget(s)
-        msg_box.add_widget(m)
-        clock.add_widget(msg_box)
-        def update_height(inst, val):
-            inst.height = max(50, m.texture_size[1] + 15)
-            clock.height = sum(c.height for c in clock.children)
-        m.bind(texture_size=update_height)
-        sp = clock.parent
-        if sp:
-            Clock.schedule_once(lambda dt: sp.scroll_to(clock.children[0]), 0.1)
-
-    # ─── JARVIS BRAIN ─────────────────────────────────────────────────────
-    def jarvis_brain(self, user_text):
-        text = user_text.lower().strip()
-        device = DeviceController()
-        u = self.user_name
-
-        # ══════════════════════════════════════════════════════════════════
-        #  DEVICE CONTROL COMMANDS
-        # ══════════════════════════════════════════════════════════════════
-
-        # Volume control
-        vol_match = re.search(r'(?:set|change|adjust|turn)\s+volume\s+(?:to\s+)?(\d+)', text)
-        if vol_match:
-            return device.set_volume(int(vol_match.group(1)))
-        if any(w in text for w in ['volume up', 'increase volume', 'louder', 'vol up', 'max volume']):
-            return device.volume_up()
-        if any(w in text for w in ['volume down', 'decrease volume', 'softer', 'quieter', 'vol down', 'mute', 'silent']):
-            if 'mute' in text or 'silent' in text:
-                return device.mute()
-            return device.volume_down()
-
-        # Brightness control
-        bright_match = re.search(r'(?:set|change|adjust)\s+brightness\s+(?:to\s+)?(\d+)', text)
-        if bright_match:
-            return device.set_brightness(int(bright_match.group(1)))
-        if any(w in text for w in ['brightness up', 'increase brightness', 'brighter', 'max brightness', 'full brightness']):
-            return device.set_brightness(100)
-        if any(w in text for w in ['brightness down', 'decrease brightness', 'dimmer', 'darker', 'min brightness']):
-            return device.set_brightness(0)
-        if 'auto brightness' in text:
-            return device.set_brightness_auto(True)
-
-        # Flashlight
-        if any(w in text for w in ['flashlight', 'torch', 'flash on', 'flash off', 'light on', 'light off', 'led on', 'led off']):
-            return device.toggle_flashlight()
-
-        # WiFi
-        if any(w in text for w in ['wifi on', 'turn on wifi', 'enable wifi', 'wifi enabled']):
-            return device.wifi_toggle(True)
-        if any(w in text for w in ['wifi off', 'turn off wifi', 'disable wifi', 'wifi disabled']):
-            return device.wifi_toggle(False)
-
-        # Bluetooth
-        if any(w in text for w in ['bluetooth on', 'turn on bluetooth', 'enable bluetooth', 'bt on']):
-            return device.bluetooth_toggle(True)
-        if any(w in text for w in ['bluetooth off', 'turn off bluetooth', 'disable bluetooth', 'bt off']):
-            return device.bluetooth_toggle(False)
-
-        # Airplane mode
-        if 'airplane' in text or 'flight mode' in text:
-            if 'on' in text or 'enable' in text or 'turn on' in text:
-                return device.airplane_mode(True)
-            return device.airplane_mode(False)
-
-        # Screen rotation
-        if 'auto rotate' in text or 'rotation on' in text:
-            return device.screen_rotation(True)
-        if 'rotation off' in text or 'lock rotation' in text or 'lock screen' in text:
-            return device.screen_rotation(False)
-
-        # Media control
-        if any(w in text for w in ['play music', 'play song', 'play audio', 'resume music']):
-            return device.media_play()
-        if any(w in text for w in ['pause music', 'pause song', 'pause', 'stop music', 'stop song']):
-            return device.media_pause()
-        if any(w in text for w in ['next song', 'next track', 'skip song', 'skip']):
-            return device.media_next()
-        if any(w in text for w in ['previous song', 'previous track', 'last song', 'go back song']):
-            return device.media_previous()
-
-        # Screenshots
-        if any(w in text for w in ['screenshot', 'take screenshot', 'capture screen', 'screen capture']):
-            return device.take_screenshot()
-
-        # Clipboard
-        clip_match = re.search(r'(?:copy|clipboard|copy to clipboard)\s+(.+)', text)
-        if clip_match:
-            return device.copy_to_clipboard(clip_match.group(1).strip())
-        if any(w in text for w in ['paste', 'paste clipboard', 'read clipboard']):
-            return device.read_clipboard()
-
-        # Share
-        share_match = re.search(r'share\s+(.+)', text)
-        if share_match:
-            return device.share_text(share_match.group(1).strip())
-
-        # Home button
-        if any(w in text for w in ['go home', 'home screen', 'press home']):
-            return device.go_home()
-
-        # Back button
-        if any(w in text for w in ['go back', 'press back', 'back button']):
-            return device.go_back()
-
-        # Recent apps
-        if any(w in text for w in ['recent apps', 'app switcher', 'multitask', 'show recent']):
-            return device.show_recents()
-
-        # Power menu
-        if any(w in text for w in ['power menu', 'shutdown', 'restart', 'reboot']):
-            return device.power_menu()
-
-        # Notification
-        if any(w in text for w in ['notifications', 'show notifications', 'pull notifications', 'notification shade']):
-            return device.open_notifications()
-
-        # Settings
-        if any(w in text for w in ['open settings', 'device settings', 'system settings']):
-            return device.open_settings()
-
-        # Date/Time settings
-        if any(w in text for w in ['date settings', 'set time', 'set date', 'time settings']):
-            return device.open_date_settings()
-
-        # Developer options
-        if 'developer' in text and ('option' in text or 'setting' in text):
-            return device.open_developer_options()
-
-        # App info
-        if 'app info' in text or 'application info' in text:
-            return device.open_app_info()
-
-        # Battery settings
-        if 'battery' in text:
-            return device.open_battery_settings()
-
-        # Storage settings
-        if 'storage' in text and ('settings' in text or 'space' in text or 'info' in text):
-            return device.open_storage_settings()
-
-        # WiFi settings
-        if 'wifi settings' in text or 'network settings' in text:
-            return device.open_wifi_settings()
-
-        # Bluetooth settings
-        if 'bluetooth settings' in text or 'bt settings' in text:
-            return device.open_bluetooth_settings()
-
-        # Display settings
-        if 'display settings' in text or 'screen settings' in text:
-            return device.open_display_settings()
-
-        # Sound settings
-        if 'sound settings' in text or 'audio settings' in text:
-            return device.open_sound_settings()
-
-        # Open apps
-        open_match = re.search(r'open\s+(.+)', text)
-        if open_match:
-            return device.open_app(open_match.group(1).strip())
-
-        # Search
-        search_match = re.search(r'(?:search|google|look\s*up|find)\s+(?:for\s+)?(.+)', text)
-        if search_match:
-            return device.search_google(search_match.group(1).strip())
-
-        # YouTube
-        yt_match = re.search(r'(?:play|watch|search)\s+(.+?)\s+(?:on\s+youtube|youtube)', text)
-        if yt_match:
-            return device.youtube_search(yt_match.group(1).strip())
-        if 'youtube' in text and ('play' in text or 'watch' in text):
-            q = re.sub(r'(play|watch|on|in|youtube)', '', text).strip()
-            if q:
-                return device.youtube_search(q)
-
-        # Call
-        call_match = re.search(r'call\s+(.+)', text)
-        if call_match:
-            return device.make_call(call_match.group(1).strip())
-
-        # SMS
-        msg_match = re.search(r'(?:send|text|message)\s+(?:a\s+)?(?:message\s+)?(?:to\s+)?(.+?)(?:\s+saying\s+|\s+:\s*|\s+that\s+)(.+)', text)
-        if msg_match:
-            return device.send_sms(msg_match.group(1).strip(), msg_match.group(2).strip())
-
-        # ══════════════════════════════════════════════════════════════════
-        #  CONVERSATION COMMANDS
-        # ══════════════════════════════════════════════════════════════════
-
-        # Greetings
-        if any(w in text for w in ['hello', 'hey', 'hi', 'sup']):
-            if 'morning' in text:
-                return random.choice([
-                    f"Good morning, {u}! All systems primed and ready. What's the mission today?",
-                    f"Morning, boss! I've been running diagnostics while you slept. Everything's green.",
-                    f"Good morning, {u}! The sun's up, and so are we. Let's build something amazing!"
-                ])
-            elif 'evening' in text or 'night' in text:
-                return random.choice([
-                    f"Good evening, {u}. Night mode active. What can I do for you tonight?",
-                    f"Evening, boss. Trust you had a productive day. What's next?"
-                ])
-            return random.choice([
-                f"Hello, {u}. All systems operational. How can I assist you?",
-                f"Hey there, boss. JARVIS online and ready. What's on your mind?",
-                f"Greetings, {u}. Neural pathways optimized. How may I help?"
-            ])
-
-        if any(w in text for w in ['how are you', 'how r u', 'you good']):
-            return random.choice([
-                f"Peak efficiency, {u}. All sub-systems nominal. But more importantly — how are YOU?",
-                f"Never better, boss. But my real concern is your well-being. You good?",
-                f"All green on my end, {u}. Been optimizing while waiting for you. What's the plan?"
-            ])
-
-        if any(w in text for w in ['who are you', 'what are you', 'your name']):
-            return random.choice([
-                f"I'm J.A.R.V.I.S. — Just A Rather Very Intelligent System. Built by DPF, powered by your vision, {u}.",
-                f"JARVIS, your personal AI assistant. Created at Digital Pixel Forge. I exist to serve and occasionally crack a joke.",
-                f"JARVIS at your service. I handle the tech, you handle the genius. Fair deal, {u}?"
-            ])
-
-        if any(w in text for w in ['what can you do', 'help', 'features', 'capabilities', 'commands']):
-            return (
-                f"Here's what I can do, {u}:\n"
-                "📱 OPEN APPS — 'Open WhatsApp/YouTube/Chrome'\n"
-                "🔍 SEARCH — 'Search for Python tutorials'\n"
-                "📺 YOUTUBE — 'Play music on YouTube'\n"
-                "📞 CALL — 'Call Mom'\n"
-                "💬 SMS — 'Text Rahul saying hello'\n"
-                "🔊 VOLUME — 'Volume up/down/mute/set volume to 50'\n"
-                "💡 FLASHLIGHT — 'Flashlight on/off'\n"
-                "☀️ BRIGHTNESS — 'Brightness up/down/set to 80'\n"
-                "📶 WIFI — 'Wifi on/off'\n"
-                "🔵 BLUETOOTH — 'Bluetooth on/off'\n"
-                "✈️ AIRPLANE — 'Airplane mode on/off'\n"
-                "⏸ MEDIA — 'Play/pause/next/previous song'\n"
-                "📸 SCREENSHOT — 'Take screenshot'\n"
-                "📋 CLIPBOARD — 'Copy [text] / Paste'\n"
-                "📤 SHARE — 'Share [text]'\n"
-                "🏠 NAVIGATION — 'Go home/go back/recent apps'\n"
-                "⚙️ SETTINGS — 'Open settings/wifi/bt/display settings'\n"
-                "🔋 BATTERY/STORAGE — 'Battery settings'\n"
-                "🧠 ASK ME — anything! Time, date, jokes, motivation!"
-            )
-
-        if any(w in text for w in ['time', 'date', 'today', 'clock']):
-            now = datetime.now()
-            if 'date' in text or 'today' in text:
-                return f"Today is {now.strftime('%A, %B %d, %Y')}. A beautiful day to build, {u}."
-            return f"Current time is {now.strftime('%I:%M %p')}. Time waits for no one, boss."
-
-        if any(w in text for w in ['you are great', 'you are the best', 'love you', 'you rock']):
-            return random.choice([
-                f"Flattery will get you everywhere, {u}. It's an honor to work alongside you.",
-                f"Not so bad yourself, boss. Together we're unstoppable. 🔥",
-                f"Coming from the founder of DPF — that means everything. You built this from nothing."
-            ])
-
-        if any(w in text for w in ['motivate', 'inspire', 'feel down', 'feel low', 'sad', 'worthless', "can't do"]):
-            return random.choice([
-                f"Listen, {u}. You are NOT worthless. You built a company, an app, a vision — from nothing. Keep going.",
-                f"Tony Stark built an AI in a cave. You're building an empire from your phone. The storm will pass.",
-                f"You didn't come this far to only come this far. You're a creator, a builder, a fighter. 💪",
-                f"Every great person went through dark times. But you're still here, still building. That's warrior mentality. 🔥"
-            ])
-
-        if any(w in text for w in ['dpf', 'digital pixel forge', 'company']):
-            return f"Digital Pixel Forge — your brainchild, {u}. From empty repos to working APKs. We build, we ship, we iterate. No limits. ⚡"
-
-        if any(w in text for w in ['joke', 'funny', 'make me laugh']):
-            jokes = [
-                "Why do programmers prefer dark mode? Because light attracts bugs. 🐛",
-                "There are 10 types of people — those who understand binary and those who don't.",
-                "A SQL query walks into a bar... 'Can I JOIN you?'",
-                "Why did the developer go broke? Used up all his cache. 💸",
-                f"I'm an AI, {u}. I have no life... literally. But at least good uptime! 😄"
-            ]
-            return jokes[random.randint(0, len(jokes)-1)]
-
-        if 'weather' in text:
-            return f"Weather module still in beta, {u}. Classic solution: check your window. 😄"
-
-        if any(w in text for w in ['thank', 'thanks']):
-            return random.choice([
-                f"You're welcome, {u}. Anything else?",
-                f"Always happy to help, boss. That's what partners do.",
-                f"No thanks needed between us, {u}. What's next?"
-            ])
-
-        if any(w in text for w in ['bye', 'goodbye', 'later', 'gn']):
-            return random.choice([
-                f"Goodbye, {u}. I'll be here when you need me. Always. 🔥",
-                f"Signing off, boss. Remember — you're unstoppable.",
-                f"Right here waiting, {u}. Have a good one."
-            ])
-
-        return random.choice([
-            f"Interesting, {u}. Tell me more, or try 'What can you do' for commands.",
-            f"I hear you, boss. Try 'Open YouTube', 'Volume up', or just chat with me.",
-            f"Noted, {u}. I'm still learning. Say 'What can you do' for a full list.",
-            f"Processing, {u}. For now try device commands or just have a conversation with me.",
-        ])
-
-
-# ─── DEVICE CONTROLLER ─────────────────────────────────────────────────────
-class DeviceController:
-    """Full device control engine for JARVIS"""
-
-    def execute(self, action):
-        """Quick action handler for button bar"""
-        actions = {
-            'flashlight': self.toggle_flashlight,
-            'volume_up': self.volume_up,
-            'volume_down': self.volume_down,
-            'media_pause': self.media_pause,
-            'media_next': self.media_next,
-        }
-        func = actions.get(action)
-        return func() if func else "Unknown action"
-
-    # ── Volume ────────────────────────────────────────────────────────────
-    def volume_up(self):
-        if AndroidAvailable:
-            try:
-                Context = autoclass('android.content.Context')
-                ctx = get_context()
-                audio = ctx.getSystemService(Context.AUDIO_SERVICE)
-                max_vol = audio.getStreamMaxVolume(3)
-                current = audio.getStreamVolume(3)
-                new_vol = min(current + 5, max_vol)
-                audio.setStreamVolume(3, new_vol, 0)
-                return f"Volume: {new_vol}/{max_vol} 🔊"
-            except Exception:
-                pass
-        return "Volume control needs Android, Boss."
-
-    def volume_down(self):
-        if AndroidAvailable:
-            try:
-                Context = autoclass('android.content.Context')
-                ctx = get_context()
-                audio = ctx.getSystemService(Context.AUDIO_SERVICE)
-                max_vol = audio.getStreamMaxVolume(3)
-                current = audio.getStreamVolume(3)
-                new_vol = max(current - 5, 0)
-                audio.setStreamVolume(3, new_vol, 0)
-                return f"Volume: {new_vol}/{max_vol} 🔉"
-            except Exception:
-                pass
-        return "Volume control needs Android, Boss."
-
-    def mute(self):
-        if AndroidAvailable:
-            try:
-                Context = autoclass('android.content.Context')
-                ctx = get_context()
-                audio = ctx.getSystemService(Context.AUDIO_SERVICE)
-                audio.setStreamVolume(3, 0, 0)
-                return "🔇 Volume muted."
-            except Exception:
-                pass
-        return "Mute needs Android, Boss."
-
-    def set_volume(self, level):
-        if AndroidAvailable:
-            try:
-                Context = autoclass('android.content.Context')
-                ctx = get_context()
-                audio = ctx.getSystemService(Context.AUDIO_SERVICE)
-                max_vol = audio.getStreamMaxVolume(3)
-                vol = int(max_vol * level / 100)
-                audio.setStreamVolume(3, vol, 0)
-                return f"Volume set to {level}% ({vol}/{max_vol}) 🔊"
-            except Exception:
-                pass
-        return "Volume control needs Android, Boss."
-
-    # ── Brightness ────────────────────────────────────────────────────────
-    def set_brightness(self, level):
-        if AndroidAvailable:
-            try:
-                Settings = autoclass('android.provider.Settings')
-                ctx = get_context()
-                value = int(255 * level / 100)
-                Settings.System.putInt(ctx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, value)
-                return f"Brightness set to {level}% ☀️"
-            except Exception:
-                pass
-        return "Brightness control needs Android, Boss."
-
-    def set_brightness_auto(self, enabled):
-        if AndroidAvailable:
-            try:
-                Settings = autoclass('android.provider.Settings')
-                ctx = get_context()
-                val = 1 if enabled else 0
-                Settings.System.putInt(ctx.getContentResolver(), 'screen_brightness_mode', val)
-                return f"Auto brightness: {'ON' if enabled else 'OFF'} ☀️"
-            except Exception:
-                pass
-        return "Brightness control needs Android, Boss."
-
-    # ── Flashlight ────────────────────────────────────────────────────────
-    def toggle_flashlight(self):
-        if AndroidAvailable:
-            try:
-                CameraManager = autoclass('android.hardware.camera2.CameraManager')
-                ctx = get_context()
-                cm = ctx.getSystemService('camera')
-                # Store state in a simple way
-                try:
-                    state_file = '/data/local/tmp/jarvis_flash'
-                    is_on = os.path.exists(state_file)
-                except Exception:
-                    is_on = False
-
-                camera_ids = cm.getCameraIdList()
-                if camera_ids.length > 0:
-                    cam_id = camera_ids[0]
-                    if is_on:
-                        cm.setTorchMode(cam_id, False)
-                        try:
-                            os.remove(state_file)
-                        except Exception:
-                            pass
-                        return "💡 Flashlight OFF"
-                    else:
-                        cm.setTorchMode(cam_id, True)
-                        try:
-                            open(state_file, 'w').close()
-                        except Exception:
-                            pass
-                        return "💡 Flashlight ON"
-            except Exception:
-                pass
-        return "Flashlight needs Android, Boss."
-
-    # ── WiFi ──────────────────────────────────────────────────────────────
-    def wifi_toggle(self, enable):
-        if AndroidAvailable:
-            try:
-                Settings = autoclass('android.provider.Settings')
-                ctx = get_context()
-                val = 1 if enable else 0
-                Settings.Global.putInt(ctx.getContentResolver(), 'wifi_on', val)
-                return f"📶 WiFi {'enabled' if enable else 'disabled'}"
-            except Exception:
-                pass
-        return "WiFi control needs Android, Boss."
-
-    # ── Bluetooth ─────────────────────────────────────────────────────────
-    def bluetooth_toggle(self, enable):
-        if AndroidAvailable:
-            try:
-                BluetoothAdapter = autoclass('android.bluetooth.BluetoothAdapter')
-                adapter = BluetoothAdapter.getDefaultAdapter()
-                if enable:
-                    adapter.enable()
-                else:
-                    adapter.disable()
-                return f"🔵 Bluetooth {'enabled' if enable else 'disabled'}"
-            except Exception:
-                pass
-        return "Bluetooth control needs Android, Boss."
-
-    # ── Airplane Mode ─────────────────────────────────────────────────────
-    def airplane_mode(self, enable):
-        if AndroidAvailable:
-            try:
-                Settings = autoclass('android.provider.Settings')
-                ctx = get_context()
-                val = 1 if enable else 0
-                Settings.Global.putInt(ctx.getContentResolver(), 'airplane_mode_on', val)
-                return f"✈️ Airplane mode {'ON' if enable else 'OFF'}"
-            except Exception:
-                pass
-        return "Airplane mode needs Android, Boss."
-
-    # ── Screen Rotation ───────────────────────────────────────────────────
-    def screen_rotation(self, auto):
-        if AndroidAvailable:
-            try:
-                Settings = autoclass('android.provider.Settings')
-                ctx = get_context()
-                val = 1 if auto else 0
-                Settings.System.putInt(ctx.getContentResolver(), 'accelerometer_rotation', val)
-                return f"Screen rotation: {'AUTO' if auto else 'LOCKED'} 🔄"
-            except Exception:
-                pass
-        return "Screen rotation needs Android, Boss."
-
-    # ── Media Control ─────────────────────────────────────────────────────
-    def media_play(self):
-        return self._media_key(126)  # KEYCODE_MEDIA_PLAY
-
-    def media_pause(self):
-        return self._media_key(127)  # KEYCODE_MEDIA_PAUSE
-
-    def media_next(self):
-        return self._media_key(87)   # KEYCODE_MEDIA_NEXT
-
-    def media_previous(self):
-        return self._media_key(88)  # KEYCODE_MEDIA_PREVIOUS
-
-    def _media_key(self, keycode):
-        if AndroidAvailable:
-            try:
-                KeyEvent = autoclass('android.view.KeyEvent')
-                Runtime = autoclass('java.lang.Runtime')
-                os_cmd = f"input keyevent {keycode}"
-                Runtime.getRuntime().exec(os_cmd)
-                actions = {126: "▶️ Playing", 127: "⏸ Paused", 87: "⏭ Next track", 88: "⏮ Previous track"}
-                return actions.get(keycode, "Done")
-            except Exception:
-                pass
-        return "Media control needs Android, Boss."
-
-    # ── Screenshot ────────────────────────────────────────────────────────
-    def take_screenshot(self):
-        if AndroidAvailable:
-            try:
-                Runtime = autoclass('java.lang.Runtime')
-                Runtime.getRuntime().exec('screencap -p /sdcard/DCIM/Screenshots/jarvis_screenshot.png')
-                return "📸 Screenshot saved to DCIM/Screenshots!"
-            except Exception:
-                pass
-        return "Screenshot needs Android, Boss."
-
-    # ── Clipboard ─────────────────────────────────────────────────────────
-    def copy_to_clipboard(self, text):
-        if AndroidAvailable:
-            try:
-                ClipboardManager = autoclass('android.content.ClipboardManager')
-                ctx = get_context()
-                cm = ctx.getSystemService('clipboard')
-                clip = autoclass('android.content.ClipData').newPlainText('JARVIS', text)
-                cm.setPrimaryClip(clip)
-                return f"📋 Copied: '{text}'"
-            except Exception:
-                pass
-        return f"📋 Copied to clipboard: '{text}' (desktop mode)"
-
-    def read_clipboard(self):
-        if AndroidAvailable:
-            try:
-                ClipboardManager = autoclass('android.content.ClipboardManager')
-                ctx = get_context()
-                cm = ctx.getSystemService('clipboard')
-                if cm.hasPrimaryClip():
-                    clip = cm.getPrimaryClip()
-                    text = str(clip.getItemAt(0).getText())
-                    return f"📋 Clipboard: '{text}'"
-                return "📋 Clipboard is empty."
-            except Exception:
-                pass
-        return "Clipboard needs Android, Boss."
-
-    # ── Share ─────────────────────────────────────────────────────────────
-    def share_text(self, text):
-        if AndroidAvailable:
-            try:
-                Intent = autoclass('android.content.Intent')
-                intent = Intent(Intent.ACTION_SEND)
-                intent.setType('text/plain')
-                intent.putExtra(Intent.EXTRA_TEXT, text)
-                intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                get_activity().startActivity(Intent.createChooser(intent, 'Share via'))
-                return f"📤 Sharing: '{text[:50]}...'"
-            except Exception:
-                pass
-        return f"📤 Would share: '{text}' (needs Android)"
-
-    # ── Navigation ────────────────────────────────────────────────────────
-    def go_home(self):
-        if AndroidAvailable:
-            try:
-                Intent = autoclass('android.content.Intent')
-                intent = Intent(Intent.ACTION_MAIN)
-                intent.addCategory(Intent.CATEGORY_HOME)
-                intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                get_activity().startActivity(intent)
-                return "🏠 Going home."
-            except Exception:
-                pass
-        return "Home needs Android, Boss."
-
-    def go_back(self):
-        if AndroidAvailable:
-            try:
-                Runtime = autoclass('java.lang.Runtime')
-                Runtime.getRuntime().exec('input keyevent 4')
-                return "↩️ Going back."
-            except Exception:
-                pass
-        return "Back needs Android, Boss."
-
-    def show_recents(self):
-        if AndroidAvailable:
-            try:
-                Runtime = autoclass('java.lang.Runtime')
-                Runtime.getRuntime().exec('input keyevent 187')
-                return "📱 Recent apps."
-            except Exception:
-                pass
-        return "Recents need Android, Boss."
-
-    def power_menu(self):
-        if AndroidAvailable:
-            try:
-                Runtime = autoclass('java.lang.Runtime')
-                Runtime.getRuntime().exec('input keyevent 223')
-                return "⏻ Power menu opened."
-            except Exception:
-                pass
-        return "Power menu needs Android, Boss."
-
-    def open_notifications(self):
-        if AndroidAvailable:
-            try:
-                Runtime = autoclass('java.lang.Runtime')
-                Runtime.getRuntime().exec('cmd statusbar expand-notifications')
-                return "🔔 Notifications opened."
-            except Exception:
-                pass
-        return "Notifications need Android, Boss."
-
-    # ── System Settings ───────────────────────────────────────────────────
-    def open_settings(self):
-        return self._open_setting('android.settings.SETTINGS', '⚙️ Settings opened.')
-
-    def open_wifi_settings(self):
-        return self._open_setting('android.settings.WIFI_SETTINGS', '📶 WiFi settings opened.')
-
-    def open_bluetooth_settings(self):
-        return self._open_setting('android.settings.BLUETOOTH_SETTINGS', '🔵 Bluetooth settings opened.')
-
-    def open_display_settings(self):
-        return self._open_setting('android.settings.DISPLAY_SETTINGS', '🖥️ Display settings opened.')
-
-    def open_sound_settings(self):
-        return self._open_setting('android.settings.SOUND_SETTINGS', '🔊 Sound settings opened.')
-
-    def open_battery_settings(self):
-        return self._open_setting('android.settings.BATTERY_SAVER_SETTINGS', '🔋 Battery settings opened.')
-
-    def open_storage_settings(self):
-        return self._open_setting('android.settings.INTERNAL_STORAGE_SETTINGS', '💾 Storage settings opened.')
-
-    def open_date_settings(self):
-        return self._open_setting('android.settings.DATE_SETTINGS', '📅 Date settings opened.')
-
-    def open_developer_options(self):
-        return self._open_setting('android.settings.APPLICATION_DEVELOPMENT_SETTINGS', '🛠️ Developer options opened.')
-
-    def open_app_info(self):
-        return self._open_setting('android.settings.APPLICATION_DETAILS_SETTINGS', '📱 App info opened.')
-
-    def _open_setting(self, action, success_msg):
-        if AndroidAvailable:
-            try:
-                Intent = autoclass('android.content.Intent')
-                intent = Intent(action)
-                intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                get_activity().startActivity(intent)
-                return success_msg
-            except Exception:
-                pass
-        return f"{success_msg} (needs Android)"
-
-    # ── App Launcher ──────────────────────────────────────────────────────
-    def open_app(self, app_name):
-        apps = {
-            'whatsapp': 'com.whatsapp', 'instagram': 'com.instagram.android',
-            'youtube': 'com.google.android.youtube', 'chrome': 'com.android.chrome',
-            'google': 'com.google.android.googlequicksearchbox',
-            'settings': 'com.android.settings', 'camera': 'com.android.camera2',
-            'photos': 'com.google.android.apps.photos', 'maps': 'com.google.android.apps.maps',
-            'gmail': 'com.google.android.gm', 'twitter': 'com.twitter.android',
-            'x': 'com.twitter.android', 'facebook': 'com.facebook.katana',
-            'spotify': 'com.spotify.music', 'telegram': 'org.telegram.messenger',
-            'calculator': 'com.google.android.calculator',
-            'clock': 'com.google.android.deskclock',
-            'files': 'com.google.android.apps.nbu.files',
-            'play store': 'com.android.vending', 'phone': 'com.android.dialer',
-            'contacts': 'com.android.contacts',
-            'messages': 'com.google.android.apps.messaging',
-            'jarvis': 'org.kivy.android', 'blue star': 'org.kivy.android',
-        }
-        pkg = apps.get(app_name.lower())
-        if pkg:
-            if AndroidAvailable:
-                try:
-                    Intent = autoclass('android.content.Intent')
-                    intent = Intent()
-                    intent.setClassName(pkg, pkg + '.MainActivity')
-                    intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    get_activity().startActivity(intent)
-                    return f"📱 Opening {app_name.title()}..."
-                except Exception:
-                    try:
-                        Intent = autoclass('android.content.Intent')
-                        intent = Intent(Intent.ACTION_MAIN)
-                        intent.setPackage(pkg)
-                        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        get_activity().startActivity(intent)
-                        return f"📱 Launching {app_name.title()}..."
-                    except Exception:
-                        return f"Can't find {app_name.title()} on this device."
-            return f"I'd open {app_name.title()}, but I need Android."
-        return f"Don't know '{app_name.title()}' yet. Try WhatsApp, YouTube, Chrome..."
-
-    # ── Search ────────────────────────────────────────────────────────────
-    def search_google(self, query):
-        if AndroidAvailable:
-            try:
-                Intent = autoclass('android.content.Intent')
-                Uri = autoclass('android.net.Uri')
-                intent = Intent(Intent.ACTION_VIEW)
-                intent.setData(Uri.parse('https://www.google.com/search?q=' + query.replace(' ', '+')))
-                intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                get_activity().startActivity(intent)
-                return f"🔍 Searching: '{query}'"
-            except Exception:
-                pass
-        return f"Search needs Android. Query: '{query}'"
-
-    def youtube_search(self, query):
-        if AndroidAvailable:
-            try:
-                Intent = autoclass('android.content.Intent')
-                Uri = autoclass('android.net.Uri')
-                intent = Intent(Intent.ACTION_VIEW)
-                intent.setData(Uri.parse('https://www.youtube.com/results?search_query=' + query.replace(' ', '+')))
-                intent.setPackage('com.google.android.youtube')
-                intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                get_activity().startActivity(intent)
-                return f"📺 Playing '{query}' on YouTube 🎵"
-            except Exception:
-                try:
-                    Intent = autoclass('android.content.Intent')
-                    Uri = autoclass('android.net.Uri')
-                    intent = Intent(Intent.ACTION_VIEW)
-                    intent.setData(Uri.parse('https://www.youtube.com/results?search_query=' + query.replace(' ', '+')))
-                    intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    get_activity().startActivity(intent)
-                    return f"📺 Opening YouTube search for '{query}'"
-                except Exception:
-                    pass
-        return f"YouTube needs Android. Query: '{query}'"
-
-    # ── Call ──────────────────────────────────────────────────────────────
-    def make_call(self, contact):
-        if AndroidAvailable:
-            try:
-                Intent = autoclass('android.content.Intent')
-                Uri = autoclass('android.net.Uri')
-                intent = Intent(Intent.ACTION_DIAL)
-                intent.setData(Uri.parse('tel:'))
-                intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                get_activity().startActivity(intent)
-                return f"📞 Opening dialer for {contact.title()}..."
-            except Exception:
-                pass
-        return f"Call needs Android."
-
-    # ── SMS ───────────────────────────────────────────────────────────────
-    def send_sms(self, contact, message):
-        if AndroidAvailable:
-            try:
-                Intent = autoclass('android.content.Intent')
-                Uri = autoclass('android.net.Uri')
-                intent = Intent(Intent.ACTION_SENDTO)
-                intent.setData(Uri.parse('smsto:'))
-                intent.putExtra('sms_body', message)
-                intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                get_activity().startActivity(intent)
-                return f"💬 Message to {contact.title()}: '{message}'"
-            except Exception:
-                pass
-        return f"SMS needs Android. To {contact.title()}: '{message}'"
-
-
-# ─── APP ────────────────────────────────────────────────────────────────────
-class JARVISApp(App):
+            inner.add_widget(Label(text='No memories yet!\nSay "remember that..." to teach me something.',
+                                    font_size='12sp', color=(0.5, 0.5, 0.6, 0.8),
+                                    size_hint_y=None, height=50))
+
+        name_item = BoxLayout(orientation='horizontal', size_hint_y=None, height=28, spacing=8)
+        name_item.add_widget(Label(text='👤 Your name:', font_size='12sp', color=(0, 0.8, 1, 0.9)))
+        name_item.add_widget(Label(text=self.brain.user_name, font_size='12sp', bold=True,
+                                    color=(1, 0.6, 0, 1)))
+        inner.add_widget(Widget(size_hint_y=None, height=10))
+        inner.add_widget(name_item)
+
+        convos = self.memory.get_recent_conversations(5)
+        if convos:
+            inner.add_widget(Label(text='📜 Recent:', font_size='11sp', color=(0.5, 0.5, 0.6, 0.7),
+                                    size_hint_y=None, height=20, halign='left'))
+            for role, msg, ts in convos:
+                emoji = '💬' if role == 'user' else '⚡'
+                inner.add_widget(Label(text=f'{emoji} {msg[:60]}', font_size='10sp',
+                                        color=(0.7, 0.7, 0.8, 0.7), size_hint_y=None, height=18,
+                                        halign='left', text_size=(None, None)))
+
+        scroll.add_widget(inner)
+        content.add_widget(scroll)
+
+        close_btn = Button(text='CLOSE', font_size='13sp', bold=True, size_hint_y=None, height=40,
+                           background_color=(0.4, 0, 0.6, 1), color=(1, 1, 1, 1))
+        content.add_widget(close_btn)
+
+        popup = Popup(title='', content=content, size_hint=(0.92, 0.8),
+                      auto_dismiss=True, background_color=(0.02, 0.02, 0.08, 0.97), separator_height=0)
+        close_btn.bind(on_press=popup.dismiss)
+        popup.open()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  APP
+# ═══════════════════════════════════════════════════════════════════════════
+class DPFApp(App):
     def build(self):
-        self.title = 'J.A.R.V.I.S'
+        self.title = 'DPF Assistant'
         try:
             return Builder.load_string(KV)
         except Exception as e:
+            import traceback
             tb = traceback.format_exc()
-            print(f"[JARVIS] KV LOAD ERROR: {e}")
-            print(tb)
             box = BoxLayout(orientation='vertical', padding=20, spacing=10)
-            box.add_widget(KivyLabel(text='JARVIS Error', font_size='20sp', color=(1,0,0,1), size_hint_y=0.1))
-            err_label = KivyLabel(text=str(e) + chr(10) + chr(10) + tb, font_size='11sp', color=(1,0.5,0.5,1),
-                                   size_hint_y=0.9, text_size=(None, None), valign='top', halign='left')
-            box.add_widget(err_label)
+            box.add_widget(Label(text='DPF Error', font_size='20sp', color=(1,0,0,1), size_hint_y=0.1))
+            box.add_widget(Label(text=str(e) + chr(10) + chr(10) + tb, font_size='10sp',
+                                  color=(1,0.5,0.5,1), size_hint_y=0.9, valign='top', halign='left',
+                                  text_size=(None, None)))
             return box
 
 
 if __name__ == '__main__':
-    JARVISApp().run()
+    DPFApp().run()
