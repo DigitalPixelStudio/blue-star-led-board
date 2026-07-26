@@ -1,18 +1,19 @@
 [app]
-title = Digital Pixel Forge
-package.name = digitalpixelforge
+title = J.A.R.V.I.S
+package.name = jarvis
 package.domain = org.digitalpixel
-version = 0.1
+version = 1.0
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
-requirements = python3,kivy
+requirements = python3,kivy,pyjnius
 orientation = portrait
 fullscreen = 1
-android.permissions = INTERNET
+android.permissions = INTERNET,RECORD_AUDIO,READ_CONTACTS,CALL_PHONE,READ_SMS,SEND_SMS,READ_PHONE_STATE
 android.api = 33
-android.api_min = 21
+android.api_min = 24
 android.ndk = 25b
 android.build_tools_version = 33.0.0
 android.accept_sdk_license = True
 android.archs = arm64-v8a
 android.format = apk
+android.release_artifact = apk
